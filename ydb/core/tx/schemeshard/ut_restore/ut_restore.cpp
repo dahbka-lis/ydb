@@ -6243,6 +6243,341 @@ Y_UNIT_TEST_SUITE(TImportTests) {
         TestGetImport(runtime, txId, "/MyRoot");
     }
 
+    Y_UNIT_TEST(ShouldImportTableFromCreateQuery) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableGeneratedStored(true);
+        runtime.GetAppData().FeatureFlags.SetEnableDataShardDirectPartImport(false);
+
+        THashMap<TString, TString> data = {
+            {"/metadata.json", R"({"version": 0})"},
+            {"/create_table.sql", R"(
+                CREATE TABLE `/OldRoot/Table` (
+                    `key` Uint32 NOT NULL,
+                    `a` Int32,
+                    `b` Int32,
+                    `sum` Int32 GENERATED ALWAYS AS (COALESCE(a, 0) + COALESCE(b, 0)) STORED,
+                    PRIMARY KEY (`key`)
+                );
+            )"},
+            {"/data_00.csv", "1,10,20,30\n2,11,21,32\n"},
+        };
+
+        Run(runtime, env, std::move(data), R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/Restored"
+              }
+            }
+        )");
+
+        const auto describe = DescribePath(runtime, "/MyRoot/Restored", true, true);
+        UNIT_ASSERT_VALUES_EQUAL(describe.GetStatus(), NKikimrScheme::StatusSuccess);
+        const auto& table = describe.GetPathDescription().GetTable();
+
+        bool foundSum = false;
+        for (const auto& column : table.GetColumns()) {
+            if (column.GetName() != "sum") {
+                continue;
+            }
+
+            foundSum = true;
+            UNIT_ASSERT_C(column.HasDefaultFromExpression(), column.ShortDebugString());
+            const auto& generated = column.GetDefaultFromExpression();
+            UNIT_ASSERT_STRING_CONTAINS(generated.GetExprText(), "COALESCE(a, 0) + COALESCE(b, 0)");
+            UNIT_ASSERT(generated.GetStored());
+        }
+        UNIT_ASSERT_C(foundSum, describe.ShortDebugString());
+
+        const auto content = ReadTable(runtime, TTestTxConfig::FakeHiveTablets, "Restored",
+            {"key"}, {"key", "a", "b", "sum"});
+        NKqp::CompareYson(R"([[[[[["10"];["20"];"1";["30"]];[["11"];["21"];"2";["32"]]];%false]]])", content);
+    }
+
+    Y_UNIT_TEST(ShouldImportTableWithVirtualColumnFromCreateQuery) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableGeneratedStored(true);
+        runtime.GetAppData().FeatureFlags.SetEnableGeneratedVirtual(true);
+        runtime.GetAppData().FeatureFlags.SetEnableDataShardDirectPartImport(false);
+
+        THashMap<TString, TString> data = {
+            {"/metadata.json", R"({"version": 0})"},
+            {"/create_table.sql", R"(
+                CREATE TABLE `/OldRoot/Table` (
+                    `key` Uint32 NOT NULL,
+                    `a` Int32,
+                    `b` Int32,
+                    `v` Int32 GENERATED ALWAYS AS (a + 1) VIRTUAL,
+                    PRIMARY KEY (`key`)
+                );
+            )"},
+            {"/data_00.csv", "1,10,20\n"},
+        };
+
+        Run(runtime, env, std::move(data), R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/Restored"
+              }
+            }
+        )");
+
+        const auto describe = DescribePath(runtime, "/MyRoot/Restored", true, true);
+        UNIT_ASSERT_VALUES_EQUAL(describe.GetStatus(), NKikimrScheme::StatusSuccess);
+        const auto& table = describe.GetPathDescription().GetTable();
+
+        bool foundVirtual = false;
+        for (const auto& column : table.GetColumns()) {
+            if (column.GetName() != "v") {
+                continue;
+            }
+
+            foundVirtual = true;
+            UNIT_ASSERT_C(column.HasDefaultFromExpression(), column.ShortDebugString());
+            const auto& generated = column.GetDefaultFromExpression();
+            UNIT_ASSERT_VALUES_EQUAL(generated.GetExprText(), "a + 1");
+            UNIT_ASSERT(!generated.GetStored());
+        }
+        UNIT_ASSERT_C(foundVirtual, describe.ShortDebugString());
+
+        const auto content = ReadTable(runtime, TTestTxConfig::FakeHiveTablets, "Restored",
+            {"key"}, {"key", "a", "b"});
+        NKqp::CompareYson(R"([[[[[["10"];["20"];"1"]];%false]]])", content);
+    }
+
+    Y_UNIT_TEST(ShouldImportTableFromCreateQueryWithIndex) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableGeneratedStored(true);
+        runtime.GetAppData().FeatureFlags.SetEnableDataShardDirectPartImport(false);
+
+        THashMap<TString, TString> data = {
+            {"/metadata.json", R"({"version": 0})"},
+            {"/create_table.sql", R"(
+                CREATE TABLE `/OldRoot/Table` (
+                    `key` Uint32 NOT NULL,
+                    `a` Int32,
+                    `b` Int32,
+                    `sum` Int32 GENERATED ALWAYS AS (COALESCE(a, 0) + COALESCE(b, 0)) STORED,
+                    PRIMARY KEY (`key`),
+                    INDEX `idx` GLOBAL ON (`a`)
+                );
+            )"},
+            {"/data_00.csv", "1,10,20,30\n2,11,21,32\n"},
+        };
+
+        Run(runtime, env, std::move(data), R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/Restored"
+              }
+            }
+        )");
+
+        TestDescribeResult(DescribePath(runtime, "/MyRoot/Restored"), {
+            NLs::PathExist,
+            NLs::IsTable,
+            NLs::IndexesCount(1),
+        });
+        TestDescribeResult(DescribePrivatePath(runtime, "/MyRoot/Restored/idx", true, true), {
+            NLs::PathExist,
+            NLs::IndexType(EIndexTypeGlobal),
+            NLs::IndexState(EIndexStateReady),
+        });
+
+        const auto content = ReadTable(runtime, TTestTxConfig::FakeHiveTablets, "Restored",
+            {"key"}, {"key", "a", "b", "sum"});
+        NKqp::CompareYson(R"([[[[[["10"];["20"];"1";["30"]];[["11"];["21"];"2";["32"]]];%false]]])", content);
+        UNIT_ASSERT_VALUES_EQUAL(CountRows(runtime, "/MyRoot/Restored/idx/indexImplTable"), 2u);
+    }
+
+    Y_UNIT_TEST(ShouldRejectUnsupportedPreparedIndexInBuildBeforeCreate) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableGeneratedStored(true);
+        runtime.GetAppData().FeatureFlags.SetEnableFulltextIndex(true);
+        runtime.GetAppData().FeatureFlags.SetEnableDataShardDirectPartImport(false);
+
+        THashMap<TString, TString> data = {
+            {"/metadata.json", R"({"version": 0})"},
+            {"/create_table.sql", R"(
+                CREATE TABLE `/OldRoot/Table` (
+                    `key` Uint64 NOT NULL,
+                    `Text` String,
+                    `Data` String,
+                    `a` Int32,
+                    `sum` Int32 GENERATED ALWAYS AS (COALESCE(a, 0) + 1) STORED,
+                    PRIMARY KEY (`key`),
+                    INDEX `fulltext_idx`
+                        GLOBAL USING fulltext_plain
+                        ON (`Text`)
+                        COVER (`Data`)
+                        WITH (tokenizer=whitespace, use_filter_lowercase=true)
+                );
+            )"},
+            {"/data_00.csv", "1,\"hello\",\"payload\",10,11\n"},
+        };
+
+        Run(runtime, env, std::move(data), R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/Restored"
+              }
+            }
+        )", Ydb::StatusIds::CANCELLED);
+
+        TestDescribeResult(DescribePath(runtime, "/MyRoot/Restored"), {
+            NLs::PathNotExist,
+        });
+    }
+
+    Y_UNIT_TEST(ShouldRejectIncompletePreparedIndexMetadataInAutoBeforeCreate) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true)
+            .EnableIndexMaterialization(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableGeneratedStored(true);
+        runtime.GetAppData().FeatureFlags.SetEnableDataShardDirectPartImport(false);
+
+        const auto idxA = GenerateTestData(R"(
+            columns {
+              name: "a"
+              type { optional_type { item { type_id: INT32 } } }
+            }
+            columns {
+              name: "key"
+              type { type_id: UINT32 }
+              not_null: true
+            }
+            primary_key: "a"
+            primary_key: "key"
+        )", {{"", 0}}, "", R"({"version": 0})");
+
+        auto data = ConvertTestData({{"/idx_a/indexImplTable", idxA}});
+        data["/metadata.json"] = R"({
+            "version": 0,
+            "indexes": [
+                {
+                    "export_prefix": "idx_a/indexImplTable",
+                    "impl_table_prefix": "idx_a/indexImplTable"
+                }
+            ]
+        })";
+        data["/create_table.sql"] = R"(
+            CREATE TABLE `/OldRoot/Table` (
+                `key` Uint32 NOT NULL,
+                `a` Int32,
+                `b` Int32,
+                `sum` Int32 GENERATED ALWAYS AS (COALESCE(a, 0) + 1) STORED,
+                PRIMARY KEY (`key`),
+                INDEX `idx_a` GLOBAL ON (`a`),
+                INDEX `idx_b` GLOBAL ON (`b`)
+            );
+        )";
+        data["/data_00.csv"] = "1,10,20,11\n";
+
+        Run(runtime, env, std::move(data), R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              index_population_mode: INDEX_POPULATION_MODE_AUTO
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/Restored"
+              }
+            }
+        )", Ydb::StatusIds::CANCELLED);
+
+        TestDescribeResult(DescribePath(runtime, "/MyRoot/Restored"), {
+            NLs::PathNotExist,
+        });
+    }
+
+    Y_UNIT_TEST(ShouldRejectAmbiguousTableSchema) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableGeneratedStored(true);
+        runtime.GetAppData().FeatureFlags.SetEnableDataShardDirectPartImport(false);
+
+        const auto testData = GenerateTestData(R"(
+            columns {
+              name: "legacy_key"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            columns {
+              name: "legacy_value"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            primary_key: "legacy_key"
+        )", {{"legacy", 2}}, "", R"({"version": 0})");
+        auto data = ConvertTestData(testData);
+        data["/create_table.sql"] = R"(
+            CREATE TABLE `/OldRoot/Table` (
+                `key` Uint32 NOT NULL,
+                `a` Int32,
+                `b` Int32,
+                `sum` Int32 GENERATED ALWAYS AS (COALESCE(a, 0) + COALESCE(b, 0)) STORED,
+                PRIMARY KEY (`key`)
+            );
+        )";
+
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+        TS3Mock s3Mock(data, TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        TestImport(runtime, 100, "/MyRoot", Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/Restored"
+              }
+            }
+        )", port));
+        env.TestWaitNotification(runtime, 100);
+
+        const auto issues = TestGetImport(runtime, 100, "/MyRoot", Ydb::StatusIds::CANCELLED)
+            .GetResponse().GetEntry().GetIssues();
+        UNIT_ASSERT_STRING_CONTAINS(NYql::IssuesFromMessageAsString(issues), "Ambiguous table schema");
+        UNIT_ASSERT_STRING_CONTAINS(NYql::IssuesFromMessageAsString(issues), "scheme.pb");
+        UNIT_ASSERT_STRING_CONTAINS(NYql::IssuesFromMessageAsString(issues), "create_table.sql");
+        TestDescribeResult(DescribePath(runtime, "/MyRoot/Restored"), {
+            NLs::PathNotExist,
+        });
+    }
+
     Y_UNIT_TEST_FLAG(ShouldImportInvalidView, EnableDataShardDirectPartImport) {
         TTestBasicRuntime runtime;
         auto options = TTestEnvOptions()

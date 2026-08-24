@@ -54,6 +54,12 @@ struct TChangefeedExportDescriptions {
 template <typename TSettings>
 constexpr bool RequiresHttpResolver = std::is_same_v<TSettings, NKikimrSchemeOp::TS3Settings>;
 
+enum class ESchemeRepresentation {
+    None,
+    Proto,
+    CreateTableQuery,
+};
+
 template <typename TSettings>
 class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
     using TThis = TS3Uploader;
@@ -185,6 +191,15 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
         auto storageOperator = ExternalStorageConfig->ConstructStorageOperator();
         Client = this->RegisterWithSameMailbox(NWrappers::CreateStorageWrapper(std::move(storageOperator)));
 
+        if (!SchemaDestinationChecked) {
+            return CheckSchemaDestination();
+        }
+
+        ContinueUpload();
+    }
+
+    void ContinueUpload() {
+
         if (!MetadataUploaded) {
             UploadMetadata();
         } else if (EnablePermissions && !PermissionsUploaded) {
@@ -238,13 +253,30 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
         PutMessage(scheme, Settings.GetSchemeKey(), SchemeChecksum, &TThis::StateUploadScheme, Settings.EncryptionSettings.GetSchemeIV());
     }
 
+    void PutCreateTableQuery(const TString& createTableQuery) {
+        PutDataWithChecksum(TString(createTableQuery), Settings.GetCreateTableQueryKey(), SchemeChecksum,
+            &TThis::StateUploadScheme, Settings.EncryptionSettings.GetSchemeIV());
+    }
+
     void UploadScheme() {
         Y_ENSURE(!SchemeUploaded);
 
-        if (!Scheme) {
+        switch (SchemeRepresentation) {
+        case ESchemeRepresentation::Proto:
+            if (!Scheme) {
+                return Finish(false, "Cannot infer scheme");
+            }
+            return PutScheme(Scheme.GetRef());
+        case ESchemeRepresentation::CreateTableQuery:
+            if (!CreateTableQuery) {
+                return Finish(false, SchemeError ? SchemeError : TString("Cannot infer scheme"));
+            }
+            return PutCreateTableQuery(CreateTableQuery.GetRef());
+        case ESchemeRepresentation::None:
             return Finish(false, "Cannot infer scheme");
         }
-        PutScheme(Scheme.GetRef());
+
+        Y_UNREACHABLE();
     }
 
     void PutPermissions(const Ydb::Scheme::ModifyPermissionsRequest& permissions) {
@@ -331,8 +363,12 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
         };
 
         if (EnableChecksums) {
-            TString checksumKey = ChecksumKey(Settings.GetSchemeKey());
-            UploadChecksum(std::move(SchemeChecksum), checksumKey, SchemeKeySuffix(false), nextStep);
+            const bool createTableQuery = SchemeRepresentation == ESchemeRepresentation::CreateTableQuery;
+            const TString schemeKey = createTableQuery ? Settings.GetCreateTableQueryKey() : Settings.GetSchemeKey();
+            const TString schemeKeySuffix = createTableQuery
+                ? CreateTableQueryKeySuffix(false)
+                : SchemeKeySuffix(false);
+            UploadChecksum(std::move(SchemeChecksum), ChecksumKey(schemeKey), schemeKeySuffix, nextStep);
         } else {
             nextStep();
         }
@@ -754,6 +790,37 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
         }
     }
 
+    void CheckSchemaDestination() {
+        auto request = Aws::S3::Model::HeadObjectRequest()
+            .WithKey(AlternateSchemaKeys[AlternateSchemaKeyIdx]);
+        this->Send(Client, new TEvExternalStorage::TEvHeadObjectRequest(request));
+        this->Become(&TThis::StateCheckSchemaDestination);
+    }
+
+    void HandleSchemaDestination(TEvExternalStorage::TEvHeadObjectResponse::TPtr& ev) {
+        const auto& result = ev->Get()->Result;
+
+        YDB_LOG_DEBUG("[Export]", {"result", result});
+
+        if (result.IsSuccess()) {
+            return Finish(false, TStringBuilder()
+                << "Export destination contains alternate schema object: "
+                << AlternateSchemaKeys[AlternateSchemaKeyIdx]);
+        }
+
+        const auto& error = result.GetError();
+        if (error.GetErrorType() == Aws::S3::S3Errors::RESOURCE_NOT_FOUND
+            || error.GetErrorType() == Aws::S3::S3Errors::NO_SUCH_KEY) {
+            if (++AlternateSchemaKeyIdx == AlternateSchemaKeys.size()) {
+                SchemaDestinationChecked = true;
+                return ContinueUpload();
+            }
+            return CheckSchemaDestination();
+        }
+
+        RetryOrFinish(error);
+    }
+
     void Finish(bool success = true, const TString& error = TString()) {
         YDB_LOG_INFO("[Export]",
             {"success", success},
@@ -825,7 +892,10 @@ public:
     explicit TS3Uploader(
             const TActorId& dataShard, ui64 txId,
             const NKikimrSchemeOp::TBackupTask& task,
+            ESchemeRepresentation schemeRepresentation,
             TMaybe<Ydb::Table::CreateTableRequest>&& scheme,
+            TMaybe<TString>&& createTableQuery,
+            TString&& schemeError,
             TVector<TChangefeedExportDescriptions> changefeeds,
             TMaybe<Ydb::Scheme::ModifyPermissionsRequest>&& permissions,
             TString&& metadata)
@@ -837,7 +907,10 @@ public:
         , HttpResolverConfig(GetHttpResolverConfigSafe(ExternalStorageConfig))
         , DataShard(dataShard)
         , TxId(txId)
+        , SchemeRepresentation(schemeRepresentation)
         , Scheme(std::move(scheme))
+        , CreateTableQuery(std::move(createTableQuery))
+        , SchemeError(std::move(schemeError))
         , Changefeeds(std::move(changefeeds))
         , Metadata(std::move(metadata))
         , Permissions(std::move(permissions))
@@ -851,6 +924,17 @@ public:
         , EnableChecksums(task.GetEnableChecksums())
         , EnablePermissions(task.GetEnablePermissions())
     {
+        if (ShardNum == 0) {
+            const TString alternateSchemaKey = CreateTableQuery
+                ? Settings.GetSchemeKey()
+                : Settings.GetCreateTableQueryKey();
+            AlternateSchemaKeys = {
+                alternateSchemaKey,
+                ChecksumKey(alternateSchemaKey),
+            };
+        } else {
+            SchemaDestinationChecked = true;
+        }
     }
 
     void Bootstrap() {
@@ -887,6 +971,16 @@ public:
             {"actorState", "StateResolveProxy"});
         switch (ev->GetTypeRewrite()) {
             hFunc(NHttp::TEvHttpProxy::TEvHttpIncomingResponse, Handle);
+        default:
+            return StateBase(ev);
+        }
+    }
+
+    STATEFN(StateCheckSchemaDestination) {
+        YDB_LOG_CREATE_CONTEXT(LogPrefix(),
+            {"actorState", "StateCheckSchemaDestination"});
+        switch (ev->GetTypeRewrite()) {
+            hFunc(TEvExternalStorage::TEvHeadObjectResponse, HandleSchemaDestination);
         default:
             return StateBase(ev);
         }
@@ -992,7 +1086,10 @@ private:
 
     const TActorId DataShard;
     const ui64 TxId;
+    const ESchemeRepresentation SchemeRepresentation;
     const TMaybe<Ydb::Table::CreateTableRequest> Scheme;
+    const TMaybe<TString> CreateTableQuery;
+    const TString SchemeError;
     const TVector<TChangefeedExportDescriptions> Changefeeds;
     const TString Metadata;
     const TMaybe<Ydb::Scheme::ModifyPermissionsRequest> Permissions;
@@ -1009,6 +1106,9 @@ private:
     bool ChangefeedsUploaded;
     bool MetadataUploaded;
     bool PermissionsUploaded;
+    bool SchemaDestinationChecked = false;
+    TVector<TString> AlternateSchemaKeys;
+    size_t AlternateSchemaKeyIdx = 0;
     bool MultiPart;
     bool Last;
 
@@ -1037,7 +1137,10 @@ IActor* CreateUploaderBySettingsType(
     const TActorId& dataShard,
     ui64 txId,
     const NKikimrSchemeOp::TBackupTask& task,
+    ESchemeRepresentation schemeRepresentation,
     TMaybe<Ydb::Table::CreateTableRequest>&& scheme,
+    TMaybe<TString>&& createTableQuery,
+    TString&& schemeError,
     TVector<TChangefeedExportDescriptions>&& changefeeds,
     TMaybe<Ydb::Scheme::ModifyPermissionsRequest>&& permissions,
     TString&& metadata)
@@ -1045,12 +1148,14 @@ IActor* CreateUploaderBySettingsType(
     if (task.HasS3Settings()) {
         return new TS3Uploader<NKikimrSchemeOp::TS3Settings>(
             dataShard, txId, task,
-            std::move(scheme), std::move(changefeeds),
+            schemeRepresentation, std::move(scheme),
+            std::move(createTableQuery), std::move(schemeError), std::move(changefeeds),
             std::move(permissions), std::move(metadata));
     } else if (task.HasFSSettings()) {
         return new TS3Uploader<NKikimrSchemeOp::TFSSettings>(
             dataShard, txId, task,
-            std::move(scheme), std::move(changefeeds),
+            schemeRepresentation, std::move(scheme),
+            std::move(createTableQuery), std::move(schemeError), std::move(changefeeds),
             std::move(permissions), std::move(metadata));
     }
 
@@ -1058,15 +1163,36 @@ IActor* CreateUploaderBySettingsType(
 }
 
 IActor* TS3Export::CreateUploader(const TActorId& dataShard, ui64 txId) const {
-    auto scheme = (Task.GetShardNum() == 0)
-        ? GenYdbScheme(Columns, Task.GetTable())
-        : Nothing();
+    ESchemeRepresentation schemeRepresentation = ESchemeRepresentation::None;
+    TMaybe<Ydb::Table::CreateTableRequest> scheme;
+    TMaybe<TString> createTableQuery;
+    TString schemeError;
+    if (Task.GetShardNum() == 0) {
+        scheme = GenYdbScheme(Columns, Task.GetTable());
+        if (ShouldGenSchemeAsCreateQuery(Task.GetTable())) {
+            schemeRepresentation = ESchemeRepresentation::CreateTableQuery;
+            createTableQuery = GenCreateTableQuery(Task, schemeError);
+        } else {
+            schemeRepresentation = ESchemeRepresentation::Proto;
+        }
+    }
 
     const bool encrypted = Task.HasEncryptionSettings();
 
     TMetadata metadata;
     metadata.SetVersion(Task.GetEnableChecksums() ? 1 : 0);
     metadata.SetEnablePermissions(Task.GetEnablePermissions());
+    if (schemeRepresentation == ESchemeRepresentation::CreateTableQuery) {
+        std::vector<TTableUserAttribute> attributes;
+        attributes.reserve(Task.GetTable().GetUserAttributes().size());
+        for (const auto& attribute : Task.GetTable().GetUserAttributes()) {
+            attributes.push_back({
+                .Key = attribute.GetKey(),
+                .Value = attribute.GetValue(),
+            });
+        }
+        metadata.SetTableUserAttributes(std::move(attributes));
+    }
 
     TVector<TChangefeedExportDescriptions> changefeeds;
     if (AppData()->FeatureFlags.GetEnableChangefeedsExport()) {
@@ -1150,7 +1276,8 @@ IActor* TS3Export::CreateUploader(const TActorId& dataShard, ui64 txId) const {
 
     return CreateUploaderBySettingsType(
         dataShard, txId, Task,
-        std::move(scheme), std::move(changefeeds),
+        schemeRepresentation, std::move(scheme),
+        std::move(createTableQuery), std::move(schemeError), std::move(changefeeds),
         std::move(permissions), metadata.Serialize());
 }
 

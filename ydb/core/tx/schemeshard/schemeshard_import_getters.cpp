@@ -350,6 +350,10 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
         return schemeKey.EndsWith(NYdb::NDump::NFiles::CreateView().FileName);
     }
 
+    static bool IsCreateTableSql(TStringBuf schemeKey) {
+        return schemeKey.EndsWith(NYdb::NDump::NFiles::CreateTable().FileName);
+    }
+
     static bool IsTable(TStringBuf schemeKey) {
         return schemeKey.EndsWith(NYdb::NDump::NFiles::TableScheme().FileName);
     }
@@ -380,6 +384,7 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
 
     static bool IsCreatedByQuery(TStringBuf schemeKey) {
         return IsView(schemeKey)
+            || IsCreateTableSql(schemeKey)
             || IsReplication(schemeKey)
             || IsTransfer(schemeKey)
             || IsExternalDataSource(schemeKey)
@@ -463,7 +468,50 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
             return;
         }
 
-        GetObject(SchemeKey, result.GetResult().GetContentLength());
+        SchemeContentLength = result.GetResult().GetContentLength();
+        if (IsTable(SchemeKey) || IsCreateTableSql(SchemeKey)) {
+            const TString alternateSchemaKey = SchemeKeyFromSettings(*ImportInfo, ItemIdx,
+                IsTable(SchemeKey)
+                    ? NYdb::NDump::NFiles::CreateTable().FileName
+                    : NYdb::NDump::NFiles::TableScheme().FileName);
+            AlternateSchemaKeys = {
+                alternateSchemaKey,
+                NBackup::ChecksumKey(alternateSchemaKey),
+            };
+            AlternateSchemaKeyIdx = 0;
+            return CheckAlternateTableSchema();
+        }
+
+        GetObject(SchemeKey, SchemeContentLength);
+    }
+
+    void CheckAlternateTableSchema() {
+        HeadObject(AlternateSchemaKeys[AlternateSchemaKeyIdx], AlternateSchemaKeyIdx == 0);
+        Become(&TThis::StateCheckAlternateTableSchema);
+    }
+
+    void HandleAlternateTableSchema(TEvExternalStorage::TEvHeadObjectResponse::TPtr& ev) {
+        const auto& result = ev->Get()->Result;
+
+        LOG_D("HandleAlternateTableSchema TEvExternalStorage::TEvHeadObjectResponse"
+            << ": self# " << SelfId()
+            << ", result# " << result);
+
+        if (result.IsSuccess()) {
+            return Reply(Ydb::StatusIds::BAD_REQUEST, TStringBuilder()
+                << "Ambiguous table schema: found both " << SchemeKey.Quote()
+                << " and " << AlternateSchemaKeys[AlternateSchemaKeyIdx].Quote());
+        }
+
+        if (NoObjectFound(result.GetError().GetErrorType())) {
+            if (++AlternateSchemaKeyIdx == AlternateSchemaKeys.size()) {
+                GetObject(SchemeKey, SchemeContentLength);
+                return Become(&TThis::StateDownloadScheme);
+            }
+            return CheckAlternateTableSchema();
+        }
+
+        CheckResult(result, "HeadObject");
     }
 
     void HandlePermissions(TEvExternalStorage::TEvHeadObjectResponse::TPtr& ev) {
@@ -1055,6 +1103,15 @@ public:
         }
     }
 
+    STATEFN(StateCheckAlternateTableSchema) {
+        switch (ev->GetTypeRewrite()) {
+            hFunc(TEvExternalStorage::TEvHeadObjectResponse, HandleAlternateTableSchema);
+
+            sFunc(TEvents::TEvWakeup, CheckAlternateTableSchema);
+            sFunc(TEvents::TEvPoisonPill, PassAway);
+        }
+    }
+
     STATEFN(StateDownloadPermissions) {
         switch (ev->GetTypeRewrite()) {
             hFunc(TEvExternalStorage::TEvHeadObjectResponse, HandlePermissions);
@@ -1103,9 +1160,13 @@ private:
 
     const TString MetadataKey;
     TString SchemeKey;
+    ui64 SchemeContentLength = 0;
     NBackup::EBackupFileType SchemeFileType = NBackup::EBackupFileType::TableSchema;
     const TString PermissionsKey;
     ui32 SchemePropertiesIdx = 0;
+
+    TVector<TString> AlternateSchemaKeys;
+    size_t AlternateSchemaKeyIdx = 0;
 
     TVector<TString> ChangefeedsPrefixes;
     ui64 IndexDownloadedChangefeed = 0;

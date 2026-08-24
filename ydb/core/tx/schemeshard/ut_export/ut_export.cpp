@@ -1606,7 +1606,7 @@ partitioning_settings {
 )");
     }
 
-    Y_UNIT_TEST(ShouldRejectExportOfTableWithGeneratedColumn) {
+    Y_UNIT_TEST(ShouldExportTableWithGeneratedColumnAsCreateQuery) {
         Env();
         Runtime().GetAppData().FeatureFlags.SetEnableGeneratedStored(true);
         Runtime().GetAppData().FeatureFlags.SetEnableGeneratedVirtual(true);
@@ -1641,7 +1641,85 @@ partitioning_settings {
             }
         )",
                 S3Port()),
-            Ydb::StatusIds::CANCELLED);
+            Ydb::StatusIds::SUCCESS);
+
+        UNIT_ASSERT(HasS3File("/create_table.sql"));
+        UNIT_ASSERT(!HasS3File("/scheme.pb"));
+        const TString ddl = GetS3FileContent("/create_table.sql");
+        UNIT_ASSERT_STRING_CONTAINS(ddl, "GENERATED ALWAYS AS (a + b) STORED");
+        UNIT_ASSERT_STRING_CONTAINS(ddl, "CREATE TABLE");
+    }
+
+    Y_UNIT_TEST(ShouldRejectGeneratedExportOverStaleSchemePb) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnableGeneratedStored(true);
+        Runtime().GetAppData().FeatureFlags.SetEnableGeneratedVirtual(true);
+        S3Mock().GetData()["/scheme.pb"] = "stale scheme";
+
+        ui64 txId = 100;
+        TestCreateTable(Runtime(), ++txId, "/MyRoot", R"(
+            Name: "Table"
+            Columns { Name: "key" Type: "Uint32" }
+            Columns { Name: "a" Type: "Int32" }
+            Columns {
+              Name: "generated"
+              Type: "Int32"
+              DefaultFromExpression {
+                ExprText: "a + 1"
+                Stored: true
+                DependencyColumnNames: ["a"]
+              }
+            }
+            KeyColumnNames: ["key"]
+        )");
+        Env().TestWaitNotification(Runtime(), txId);
+
+        TestExport(Runtime(), ++txId, "/MyRoot", Sprintf(R"(
+            ExportToS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_path: "/MyRoot/Table"
+                destination_prefix: ""
+              }
+            }
+        )", S3Port()));
+        Env().TestWaitNotification(Runtime(), txId);
+
+        const auto issues = TestGetExport(Runtime(), txId, "/MyRoot", Ydb::StatusIds::CANCELLED)
+            .GetResponse().GetEntry().GetIssues();
+        UNIT_ASSERT_STRING_CONTAINS(NYql::IssuesFromMessageAsString(issues), "Export destination contains alternate schema object");
+        CheckNoSuchS3Files({"/data_00.csv"});
+    }
+
+    Y_UNIT_TEST(ShouldRejectRegularExportOverStaleCreateTableQuery) {
+        Env();
+        S3Mock().GetData()["/create_table.sql.sha256"] = "stale checksum";
+
+        ui64 txId = 100;
+        TestCreateTable(Runtime(), ++txId, "/MyRoot", R"(
+            Name: "Table"
+            Columns { Name: "key" Type: "Uint32" }
+            KeyColumnNames: ["key"]
+        )");
+        Env().TestWaitNotification(Runtime(), txId);
+
+        TestExport(Runtime(), ++txId, "/MyRoot", Sprintf(R"(
+            ExportToS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_path: "/MyRoot/Table"
+                destination_prefix: ""
+              }
+            }
+        )", S3Port()));
+        Env().TestWaitNotification(Runtime(), txId);
+
+        const auto issues = TestGetExport(Runtime(), txId, "/MyRoot", Ydb::StatusIds::CANCELLED)
+            .GetResponse().GetEntry().GetIssues();
+        UNIT_ASSERT_STRING_CONTAINS(NYql::IssuesFromMessageAsString(issues), "Export destination contains alternate schema object");
+        CheckNoSuchS3Files({"/data_00.csv"});
     }
 
     Y_UNIT_TEST(ShouldPreserveIncrBackupFlag) {
