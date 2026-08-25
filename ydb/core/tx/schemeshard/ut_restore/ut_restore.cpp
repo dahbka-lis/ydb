@@ -21,6 +21,7 @@
 #include <ydb/core/tx/schemeshard/schemeshard_private.h>
 #include <ydb/core/tx/schemeshard/ut_helpers/helpers.h>
 #include <ydb/core/tx/schemeshard/ut_helpers/test_with_reboots.h>
+#include <ydb/core/tx/tx_allocator_client/actor_client.h>
 #include <ydb/core/wrappers/events/get_object.h>
 #include <ydb/core/wrappers/ut_helpers/s3_mock.h>
 #include <ydb/core/ydb_convert/table_description.h>
@@ -6784,6 +6785,80 @@ Y_UNIT_TEST_SUITE(TImportTests) {
         ShouldRejectCreateTableQueryCompileResult(
             ECreateTableQueryCompileResult::WrongDestination,
             "does not match destination path");
+    }
+
+    Y_UNIT_TEST(CreateTableQueryRejectsPersistedWrongTypeAfterRestart) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableViews(true);
+        runtime.GetAppData().FeatureFlags.SetEnableDataShardDirectPartImport(false);
+
+        THashMap<TString, TString> data = {
+            {"/metadata.json", R"({"version": 0})"},
+            {"/create_table.sql", R"(CREATE TABLE `/OldRoot/Original` (
+                key Uint32 NOT NULL,
+                PRIMARY KEY (key)
+            );)"},
+        };
+
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+        TS3Mock s3Mock(std::move(data), TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        bool mutated = false;
+        auto queryResultObserver = runtime.AddObserver<TEvPrivate::TEvImportSchemeQueryResult>([&](auto& ev) {
+            if (mutated || ev->Get()->Status != Ydb::StatusIds::SUCCESS
+                || !std::holds_alternative<NKikimrSchemeOp::TModifyScheme>(ev->Get()->Result))
+            {
+                return;
+            }
+
+            auto& prepared = const_cast<NKikimrSchemeOp::TModifyScheme&>(
+                std::get<NKikimrSchemeOp::TModifyScheme>(ev->Get()->Result));
+            prepared.Clear();
+            prepared.SetWorkingDir("/MyRoot");
+            prepared.SetOperationType(NKikimrSchemeOp::ESchemeOpCreateView);
+            prepared.MutableCreateView()->SetName("Restored");
+            prepared.MutableCreateView()->SetQueryText("SELECT 1");
+            mutated = true;
+        });
+        TBlockEvents<TEvTxAllocatorClient::TEvAllocateResult> allocatorBlocker(runtime, [&](const auto&) {
+            return mutated;
+        });
+
+        const ui64 importId = 101;
+        TestImport(runtime, importId, "/MyRoot", Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/Restored"
+              }
+            }
+        )", port));
+
+        runtime.WaitFor("persisted wrong-type creation operation awaiting tx id", [&] {
+            return mutated && !allocatorBlocker.empty();
+        });
+        allocatorBlocker.Stop();
+        allocatorBlocker.clear();
+        RebootTablet(runtime, TTestTxConfig::SchemeShard, runtime.AllocateEdgeActor());
+
+        env.TestWaitNotification(runtime, importId);
+        const auto response = TestGetImport(
+            runtime, importId, "/MyRoot", Ydb::StatusIds::CANCELLED);
+        UNIT_ASSERT(mutated);
+        UNIT_ASSERT_STRING_CONTAINS(
+            NYql::IssuesFromMessageAsString(response.GetResponse().GetEntry().GetIssues()),
+            "expected CREATE TABLE scheme operation");
+        TestDescribeResult(DescribePath(runtime, "/MyRoot/Restored"), {
+            NLs::PathNotExist,
+        });
     }
 
     Y_UNIT_TEST(CreationQueryPathTypePersistsAcrossSchemeShardRestart) {

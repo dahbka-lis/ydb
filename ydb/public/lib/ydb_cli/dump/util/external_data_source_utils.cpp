@@ -47,7 +47,7 @@ bool RewriteCreateExternalDataSourceQueryNoSecrets(
     const TString& dbPath,
     NYql::TIssues& issues)
 {
-    return RewriteCreateQuery(query, "CREATE EXTERNAL DATA SOURCE IF NOT EXISTS `{}`", dbPath, issues);
+    return RewriteSchemeCreateQueryPath(query, ESchemeCreateQueryType::ExternalDataSource, dbPath, issues);
 }
 
 bool RewriteCreateExternalDataSourceQuery(

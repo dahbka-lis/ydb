@@ -808,6 +808,14 @@ private:
             return false;
         }
 
+        if (TString error; !ValidatePreparedQueryOperation(
+                *item.PreparedCreationQuery, item.CreationQueryPathType, error))
+        {
+            NIceDb::TNiceDb db(txc.DB);
+            CancelAndPersist(db, importInfo, itemIdx, error, "invalid prepared creation query");
+            return false;
+        }
+
         if (TString error; !ValidatePreparedIndexes(*importInfo, itemIdx, error)) {
             NIceDb::TNiceDb db(txc.DB);
             CancelAndPersist(db, importInfo, itemIdx, error, "invalid prepared index population");

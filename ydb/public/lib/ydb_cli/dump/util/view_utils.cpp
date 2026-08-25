@@ -212,7 +212,7 @@ bool RewriteCreateViewQuery(
         return false;
     }
 
-    return RewriteCreateQuery(query, "CREATE VIEW IF NOT EXISTS `{}`", dbPath, issues);
+    return RewriteSchemeCreateQueryPath(query, ESchemeCreateQueryType::View, dbPath, issues);
 }
 
 } // NYdb::NDump

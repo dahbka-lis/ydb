@@ -27,6 +27,7 @@
 #include <re2/re2.h>
 
 #include <format>
+#include <functional>
 
 namespace NYdb::NDump {
 
@@ -388,6 +389,207 @@ bool RewriteCreateQuery(TString& query, std::string_view pattern, const std::str
     return false;
 }
 
+namespace {
+
+template <typename TCallback>
+void VisitMutableMessages(NProtoBuf::Message& message, TCallback& callback) {
+    callback(message);
+
+    const auto* descriptor = message.GetDescriptor();
+    for (int i = 0; i < descriptor->field_count(); ++i) {
+        NProtoBuf::TMutableField field(message, descriptor->field(i));
+        if (!field.IsMessage()) {
+            continue;
+        }
+
+        for (size_t j = 0; j < field.Size(); ++j) {
+            VisitMutableMessages(*field.MutableMessage(j), callback);
+        }
+    }
+}
+
+struct TSupportedCreateStatement {
+    ESchemeCreateQueryType Type;
+    NProtoBuf::Message* Statement;
+};
+
+TVector<TSupportedCreateStatement> FindSupportedCreateStatements(TRule_sql_query& query) {
+    TVector<TSupportedCreateStatement> statements;
+    auto collect = [&statements](NProtoBuf::Message& message) {
+        if (dynamic_cast<TRule_create_view_stmt*>(&message)) {
+            statements.push_back({ESchemeCreateQueryType::View, &message});
+            return;
+        }
+        if (dynamic_cast<TRule_create_replication_stmt*>(&message)) {
+            statements.push_back({ESchemeCreateQueryType::Replication, &message});
+            return;
+        }
+        if (dynamic_cast<TRule_create_transfer_stmt*>(&message)) {
+            statements.push_back({ESchemeCreateQueryType::Transfer, &message});
+            return;
+        }
+        if (dynamic_cast<TRule_create_external_data_source_stmt*>(&message)) {
+            statements.push_back({ESchemeCreateQueryType::ExternalDataSource, &message});
+            return;
+        }
+        if (auto* createTable = dynamic_cast<TRule_create_table_stmt*>(&message)) {
+            if (createTable->GetBlock3().HasAlt3()) {
+                statements.push_back({ESchemeCreateQueryType::ExternalTable, &message});
+            } else if (createTable->GetBlock3().HasAlt1()) {
+                statements.push_back({ESchemeCreateQueryType::Table, &message});
+            }
+        }
+    };
+    VisitMutableMessages(query, collect);
+    return statements;
+}
+
+TVector<TToken*> FindTokens(NProtoBuf::Message& message) {
+    TVector<TToken*> tokens;
+    auto collect = [&tokens](NProtoBuf::Message& current) {
+        if (auto* token = dynamic_cast<TToken*>(&current)) {
+            tokens.push_back(token);
+        }
+    };
+    VisitMutableMessages(message, collect);
+    return tokens;
+}
+
+TString RenderTokens(const NProtoBuf::Message& message) {
+    TStringBuilder result;
+    std::function<void(const NProtoBuf::Message&)> visit = [&](const NProtoBuf::Message& current) {
+        if (const auto* token = dynamic_cast<const TToken*>(&current)) {
+            if (token->GetValue() != "<EOF>") {
+                if (!result.empty()) {
+                    result << ' ';
+                }
+                result << token->GetValue();
+            }
+            return;
+        }
+
+        const auto* descriptor = current.GetDescriptor();
+        for (int i = 0; i < descriptor->field_count(); ++i) {
+            NProtoBuf::TConstField field(current, descriptor->field(i));
+            if (!field.IsMessage()) {
+                continue;
+            }
+
+            for (size_t j = 0; j < field.Size(); ++j) {
+                visit(*field.Get<const NProtoBuf::Message*>(j));
+            }
+        }
+    };
+    visit(message);
+    return result;
+}
+
+bool RewriteObjectPath(
+    TRule_object_ref& objectRef,
+    const TString& statementName,
+    const TString& dstPath,
+    NYql::TIssues& issues)
+{
+    if (objectRef.HasBlock1()) {
+        issues.AddIssue(TStringBuilder() << statementName << " object path must not be cluster-qualified");
+        return false;
+    }
+
+    auto* path = objectRef.MutableRule_id_or_at2();
+    if (path->HasBlock1()) {
+        issues.AddIssue(TStringBuilder() << statementName << " object path must not use an anonymous table marker");
+        return false;
+    }
+
+    auto tokens = FindTokens(*path);
+    if (tokens.size() != 1) {
+        issues.AddIssue(TStringBuilder()
+            << "expected one identifier token in " << statementName
+            << " object path, found " << tokens.size());
+        return false;
+    }
+
+    tokens.front()->SetValue(TStringBuilder() << '`' << dstPath << '`');
+    return true;
+}
+
+bool RewriteSimpleTablePath(
+    TRule_simple_table_ref_core& tableRef,
+    const TString& statementName,
+    const TString& dstPath,
+    NYql::TIssues& issues)
+{
+    if (!tableRef.HasAlt_simple_table_ref_core1()) {
+        issues.AddIssue(TStringBuilder() << statementName << " object path must be a literal identifier");
+        return false;
+    }
+
+    return RewriteObjectPath(
+        *tableRef.MutableAlt_simple_table_ref_core1()->MutableRule_object_ref1(),
+        statementName,
+        dstPath,
+        issues);
+}
+
+bool RewriteSupportedCreateStatementPath(
+    const TSupportedCreateStatement& statement,
+    const TString& dstPath,
+    NYql::TIssues& issues)
+{
+    switch (statement.Type) {
+        case ESchemeCreateQueryType::Table: {
+            auto* createTable = dynamic_cast<TRule_create_table_stmt*>(statement.Statement);
+            return RewriteSimpleTablePath(
+                *createTable->MutableRule_simple_table_ref5()->MutableRule_simple_table_ref_core1(),
+                "CREATE TABLE",
+                dstPath,
+                issues);
+        }
+        case ESchemeCreateQueryType::View: {
+            auto* createView = dynamic_cast<TRule_create_view_stmt*>(statement.Statement);
+            return RewriteSimpleTablePath(
+                *createView->MutableRule_simple_table_ref_core4(),
+                "CREATE VIEW",
+                dstPath,
+                issues);
+        }
+        case ESchemeCreateQueryType::Replication: {
+            auto* createReplication = dynamic_cast<TRule_create_replication_stmt*>(statement.Statement);
+            return RewriteObjectPath(
+                *createReplication->MutableRule_object_ref4(),
+                "CREATE ASYNC REPLICATION",
+                dstPath,
+                issues);
+        }
+        case ESchemeCreateQueryType::Transfer: {
+            auto* createTransfer = dynamic_cast<TRule_create_transfer_stmt*>(statement.Statement);
+            return RewriteObjectPath(
+                *createTransfer->MutableRule_object_ref3(),
+                "CREATE TRANSFER",
+                dstPath,
+                issues);
+        }
+        case ESchemeCreateQueryType::ExternalDataSource: {
+            auto* createExternalDataSource = dynamic_cast<TRule_create_external_data_source_stmt*>(statement.Statement);
+            return RewriteObjectPath(
+                *createExternalDataSource->MutableRule_object_ref7(),
+                "CREATE EXTERNAL DATA SOURCE",
+                dstPath,
+                issues);
+        }
+        case ESchemeCreateQueryType::ExternalTable: {
+            auto* createExternalTable = dynamic_cast<TRule_create_table_stmt*>(statement.Statement);
+            return RewriteSimpleTablePath(
+                *createExternalTable->MutableRule_simple_table_ref5()->MutableRule_simple_table_ref_core1(),
+                "CREATE EXTERNAL TABLE",
+                dstPath,
+                issues);
+        }
+    }
+}
+
+} // anonymous
+
 TMaybe<ESchemeCreateQueryType> ClassifySchemeCreateQuery(
     const TString& query,
     NYql::TIssues& issues)
@@ -435,6 +637,40 @@ TMaybe<ESchemeCreateQueryType> ClassifySchemeCreateQuery(
     return types.front();
 }
 
+bool RewriteSchemeCreateQueryPath(
+    TString& query,
+    ESchemeCreateQueryType expectedType,
+    const TString& dstPath,
+    NYql::TIssues& issues)
+{
+    TRule_sql_query queryProto;
+    if (!SqlToProtoAst(query, queryProto, issues)) {
+        return false;
+    }
+
+    auto statements = FindSupportedCreateStatements(queryProto);
+    if (statements.size() != 1) {
+        issues.AddIssue(TStringBuilder()
+            << "expected exactly one supported CREATE statement, found " << statements.size());
+        return false;
+    }
+    if (statements.front().Type != expectedType) {
+        issues.AddIssue("prepared CREATE statement type changed while rewriting its destination");
+        return false;
+    }
+    if (!RewriteSupportedCreateStatementPath(statements.front(), dstPath, issues)) {
+        return false;
+    }
+
+    TString formattedQuery;
+    if (!Format(RenderTokens(queryProto), formattedQuery, issues)) {
+        return false;
+    }
+
+    query = std::move(formattedQuery);
+    return true;
+}
+
 bool RewriteSchemeCreateQuery(
     TString& query,
     const TString& restoreRoot,
@@ -458,7 +694,7 @@ bool RewriteSchemeCreateQuery(
         case ESchemeCreateQueryType::ExternalTable:
             return RewriteCreateExternalTableQuery(query, restoreRoot, dstPath, issues);
         case ESchemeCreateQueryType::Table:
-            return RewriteCreateTableQuery(query, restoreRoot, dstPath, issues);
+            return RewriteSchemeCreateQueryPath(query, *type, dstPath, issues);
     }
 }
 

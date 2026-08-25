@@ -19,9 +19,108 @@ using namespace NKikimr::NKqp;
 
 namespace NKikimr::NSchemeShard {
 
+namespace {
+
+ui32 CountSupportedCreationPayloads(const NKikimrSchemeOp::TModifyScheme& modifyScheme) {
+    return modifyScheme.HasCreateTable()
+        + modifyScheme.HasCreateIndexedTable()
+        + modifyScheme.HasCreateView()
+        + modifyScheme.HasReplication()
+        + modifyScheme.HasCreateExternalDataSource()
+        + modifyScheme.HasCreateExternalTable();
+}
+
+TString ExpectedSchemeOperation(NKikimrSchemeOp::EPathType pathType) {
+    switch (pathType) {
+    case NKikimrSchemeOp::EPathTypeTable:
+        return "expected CREATE TABLE scheme operation";
+    case NKikimrSchemeOp::EPathTypeView:
+        return "expected CREATE VIEW scheme operation";
+    case NKikimrSchemeOp::EPathTypeReplication:
+        return "expected CREATE ASYNC REPLICATION scheme operation";
+    case NKikimrSchemeOp::EPathTypeTransfer:
+        return "expected CREATE TRANSFER scheme operation";
+    case NKikimrSchemeOp::EPathTypeExternalDataSource:
+        return "expected CREATE EXTERNAL DATA SOURCE scheme operation";
+    case NKikimrSchemeOp::EPathTypeExternalTable:
+        return "expected CREATE EXTERNAL TABLE scheme operation";
+    default:
+        return "missing persisted creation-query path type; restart the import";
+    }
+}
+
+} // anonymous
+
+TMaybe<NKikimrSchemeOp::EPathType> GetPreparedQueryPathType(
+    const NKikimrSchemeOp::TModifyScheme& modifyScheme)
+{
+    if (CountSupportedCreationPayloads(modifyScheme) != 1) {
+        return Nothing();
+    }
+
+    switch (modifyScheme.GetOperationType()) {
+    case NKikimrSchemeOp::ESchemeOpCreateTable:
+        if (modifyScheme.HasCreateTable()) {
+            return NKikimrSchemeOp::EPathTypeTable;
+        }
+        return Nothing();
+    case NKikimrSchemeOp::ESchemeOpCreateIndexedTable:
+        if (modifyScheme.HasCreateIndexedTable()
+            && modifyScheme.GetCreateIndexedTable().HasTableDescription())
+        {
+            return NKikimrSchemeOp::EPathTypeTable;
+        }
+        return Nothing();
+    case NKikimrSchemeOp::ESchemeOpCreateView:
+        if (modifyScheme.HasCreateView()) {
+            return NKikimrSchemeOp::EPathTypeView;
+        }
+        return Nothing();
+    case NKikimrSchemeOp::ESchemeOpCreateReplication:
+        if (modifyScheme.HasReplication()) {
+            return NKikimrSchemeOp::EPathTypeReplication;
+        }
+        return Nothing();
+    case NKikimrSchemeOp::ESchemeOpCreateTransfer:
+        if (modifyScheme.HasReplication()) {
+            return NKikimrSchemeOp::EPathTypeTransfer;
+        }
+        return Nothing();
+    case NKikimrSchemeOp::ESchemeOpCreateExternalDataSource:
+        if (modifyScheme.HasCreateExternalDataSource()) {
+            return NKikimrSchemeOp::EPathTypeExternalDataSource;
+        }
+        return Nothing();
+    case NKikimrSchemeOp::ESchemeOpCreateExternalTable:
+        if (modifyScheme.HasCreateExternalTable()) {
+            return NKikimrSchemeOp::EPathTypeExternalTable;
+        }
+        return Nothing();
+    default:
+        return Nothing();
+    }
+}
+
+bool ValidatePreparedQueryOperation(
+    const NKikimrSchemeOp::TModifyScheme& modifyScheme,
+    NKikimrSchemeOp::EPathType expectedPathType,
+    TString& error)
+{
+    const auto pathType = GetPreparedQueryPathType(modifyScheme);
+    if (!pathType || *pathType != expectedPathType) {
+        error = ExpectedSchemeOperation(expectedPathType);
+        return false;
+    }
+    return true;
+}
+
 TMaybe<TString> GetPreparedQueryTargetPath(
     const NKikimrSchemeOp::TModifyScheme& modifyScheme)
 {
+    if (!GetPreparedQueryPathType(modifyScheme)) {
+        return Nothing();
+    }
+
     TString name;
     switch (modifyScheme.GetOperationType()) {
     case NKikimrSchemeOp::ESchemeOpCreateTable:
@@ -76,6 +175,12 @@ class TSchemeQueryExecutor: public TActorBootstrapped<TSchemeQueryExecutor> {
         Ydb::StatusIds::StatusCode status,
         NKikimrSchemeOp::TModifyScheme preparedQuery)
     {
+        if (TString error; !ValidatePreparedQueryOperation(
+                preparedQuery, CreationQueryPathType, error))
+        {
+            return Finish(Ydb::StatusIds::GENERIC_ERROR, std::move(error));
+        }
+
         const auto targetPath = GetPreparedQueryTargetPath(preparedQuery);
         const TString canonicalDestination = CanonizePath(DestinationPath);
         if (!targetPath || *targetPath != canonicalDestination) {

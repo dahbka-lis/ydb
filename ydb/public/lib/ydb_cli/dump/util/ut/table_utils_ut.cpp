@@ -79,6 +79,23 @@ Y_UNIT_TEST_SUITE(TTableUtilsTest) {
         UNIT_ASSERT_STRING_CONTAINS(query, "USE plato");
     }
 
+    Y_UNIT_TEST(SchemeCreatePathIgnoresLeadingSameTypeMarker) {
+        TString query = R"(
+            $marker = 'CREATE VIEW IF NOT EXISTS `/OldRoot/Decoy`';
+            CREATE VIEW IF NOT EXISTS `/OldRoot/View`
+                WITH (security_invoker = TRUE)
+                AS SELECT $marker;
+        )";
+        NYql::TIssues issues;
+
+        UNIT_ASSERT_C(
+            RewriteSchemeCreateQuery(query, "/NewRoot", "/NewRoot/View", issues),
+            issues.ToString());
+        UNIT_ASSERT_STRING_CONTAINS(query, "`/NewRoot/View`");
+        UNIT_ASSERT_STRING_CONTAINS(query, "'CREATE VIEW IF NOT EXISTS `/OldRoot/Decoy`'");
+        UNIT_ASSERT(!query.Contains("`/OldRoot/View`"));
+    }
+
     Y_UNIT_TEST(RejectsClusterQualifiedTablePathWithoutMutation) {
         TString query = R"(
             $cluster = "plato";

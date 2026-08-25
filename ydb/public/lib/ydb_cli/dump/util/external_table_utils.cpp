@@ -114,7 +114,7 @@ bool RewriteCreateExternalTableQuery(
     if (!RewriteDataSourcePath(query, dbRestoreRoot, issues)) {
         return false;
     }
-    return RewriteCreateQuery(query, "CREATE EXTERNAL TABLE IF NOT EXISTS `{}`", dbPath, issues);
+    return RewriteSchemeCreateQueryPath(query, ESchemeCreateQueryType::ExternalTable, dbPath, issues);
 }
 
 }

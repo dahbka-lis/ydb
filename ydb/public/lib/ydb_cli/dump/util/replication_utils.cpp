@@ -197,7 +197,7 @@ bool RewriteCreateAsyncReplicationQueryNoSecrets(
     if (!RewriteObjectRefs(query, dbRestoreRoot, issues)) {
         return false;
     }
-    return RewriteCreateQuery(query, "CREATE ASYNC REPLICATION `{}`", dbPath, issues);
+    return RewriteSchemeCreateQueryPath(query, ESchemeCreateQueryType::Replication, dbPath, issues);
 }
 
 bool RewriteCreateTransferQueryNoSecrets(
@@ -209,7 +209,7 @@ bool RewriteCreateTransferQueryNoSecrets(
     if (!RewriteObjectRefs(query, dbRestoreRoot, issues)) {
         return false;
     }
-    return RewriteCreateQuery(query, "CREATE TRANSFER `{}`", dbPath, issues);
+    return RewriteSchemeCreateQueryPath(query, ESchemeCreateQueryType::Transfer, dbPath, issues);
 }
 
 bool RewriteCreateAsyncReplicationQuery(

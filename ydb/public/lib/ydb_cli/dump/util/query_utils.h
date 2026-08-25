@@ -43,6 +43,12 @@ TMaybe<ESchemeCreateQueryType> ClassifySchemeCreateQuery(
     const TString& query,
     NYql::TIssues& issues);
 
+bool RewriteSchemeCreateQueryPath(
+    TString& query,
+    ESchemeCreateQueryType expectedType,
+    const TString& dstPath,
+    NYql::TIssues& issues);
+
 bool RewriteSchemeCreateQuery(
     TString& query,
     const TString& restoreRoot,

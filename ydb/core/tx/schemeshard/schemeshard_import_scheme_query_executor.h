@@ -12,6 +12,14 @@ class TModifyScheme;
 
 namespace NKikimr::NSchemeShard {
 
+TMaybe<NKikimrSchemeOp::EPathType> GetPreparedQueryPathType(
+    const NKikimrSchemeOp::TModifyScheme& modifyScheme);
+
+bool ValidatePreparedQueryOperation(
+    const NKikimrSchemeOp::TModifyScheme& modifyScheme,
+    NKikimrSchemeOp::EPathType expectedPathType,
+    TString& error);
+
 TMaybe<TString> GetPreparedQueryTargetPath(
     const NKikimrSchemeOp::TModifyScheme& modifyScheme);
 
