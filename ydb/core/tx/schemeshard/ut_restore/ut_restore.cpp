@@ -6,6 +6,8 @@
 #include <ydb/core/backup/common/encryption.h>
 #include <ydb/core/base/localdb.h>
 #include <ydb/core/base/table_index.h>
+#include <ydb/core/kqp/common/events/events.h>
+#include <ydb/core/kqp/query_data/kqp_prepared_query.h>
 #include <ydb/core/kqp/ut/common/kqp_ut_common.h>
 #include <ydb/core/metering/metering.h>
 #include <ydb/core/protos/schemeshard/operations.pb.h>
@@ -6575,6 +6577,263 @@ Y_UNIT_TEST_SUITE(TImportTests) {
         UNIT_ASSERT_STRING_CONTAINS(NYql::IssuesFromMessageAsString(issues), "create_table.sql");
         TestDescribeResult(DescribePath(runtime, "/MyRoot/Restored"), {
             NLs::PathNotExist,
+        });
+    }
+
+    void ShouldRejectCreationQueryType(
+        const TString& fileName,
+        const TString& creationQuery,
+        const TString& expectedError)
+    {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableViews(true);
+        runtime.GetAppData().FeatureFlags.SetEnableDataShardDirectPartImport(false);
+
+        THashMap<TString, TString> data = {
+            {"/metadata.json", R"({"version": 0})"},
+            {fileName, creationQuery},
+        };
+
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+        TS3Mock s3Mock(std::move(data), TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        const ui64 importId = 101;
+        TestImport(runtime, importId, "/MyRoot", Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/Restored"
+              }
+            }
+        )", port));
+        env.TestWaitNotification(runtime, importId);
+
+        const auto response = TestGetImport(
+            runtime, importId, "/MyRoot", Ydb::StatusIds::CANCELLED);
+        UNIT_ASSERT_STRING_CONTAINS(
+            NYql::IssuesFromMessageAsString(response.GetResponse().GetEntry().GetIssues()),
+            expectedError);
+        TestDescribeResult(DescribePath(runtime, "/MyRoot/Restored"), {
+            NLs::PathNotExist,
+        });
+    }
+
+    Y_UNIT_TEST(CreateTableQueryRejectsCreateViewContent) {
+        ShouldRejectCreationQueryType(
+            "/create_table.sql",
+            R"(CREATE VIEW `/OldRoot/Object` WITH (security_invoker = TRUE) AS SELECT 1;)",
+            "expected CREATE TABLE scheme operation");
+    }
+
+    Y_UNIT_TEST(CreateTableQueryRejectsCreateTableContentForViewContract) {
+        ShouldRejectCreationQueryType(
+            "/create_view.sql",
+            R"(CREATE TABLE `/OldRoot/Object` (key Uint32 NOT NULL, PRIMARY KEY (key));)",
+            "expected CREATE VIEW scheme operation");
+    }
+
+    enum class ECreateTableQueryCompileResult {
+        Empty,
+        Multiple,
+        WrongOperation,
+        WrongDestination,
+    };
+
+    void ShouldRejectCreateTableQueryCompileResult(
+        ECreateTableQueryCompileResult mutation,
+        const TString& expectedError)
+    {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableDataShardDirectPartImport(false);
+
+        THashMap<TString, TString> data = {
+            {"/metadata.json", R"({"version": 0})"},
+            {"/create_table.sql", R"(CREATE TABLE `/OldRoot/Original` (
+                key Uint32 NOT NULL,
+                PRIMARY KEY (key)
+            );)"},
+        };
+
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+        TS3Mock s3Mock(std::move(data), TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        bool mutated = false;
+        auto compileResponseObserver = runtime.AddObserver<NKikimr::NKqp::TEvKqp::TEvCompileResponse>([&](auto& ev) {
+            const auto* result = ev->Get()->CompileResult.get();
+            if (mutated || !result || !result->PreparedQuery) {
+                return;
+            }
+
+            auto* preparedQuery = new NKikimrKqp::TPreparedQuery();
+            preparedQuery->MutablePhysicalQuery()->CopyFrom(result->PreparedQuery->GetPhysicalQuery());
+            auto* transactions = preparedQuery->MutablePhysicalQuery()->MutableTransactions();
+
+            switch (mutation) {
+            case ECreateTableQueryCompileResult::Empty:
+                transactions->Clear();
+                break;
+            case ECreateTableQueryCompileResult::Multiple: {
+                UNIT_ASSERT_VALUES_EQUAL(transactions->size(), 1);
+                const auto transaction = transactions->Get(0);
+                transactions->Add()->CopyFrom(transaction);
+                break;
+            }
+            case ECreateTableQueryCompileResult::WrongOperation: {
+                UNIT_ASSERT_VALUES_EQUAL(transactions->size(), 1);
+                auto* schemeOperation = transactions->Mutable(0)->MutableSchemeOperation();
+                UNIT_ASSERT(schemeOperation->HasCreateTable());
+                const auto modifyScheme = schemeOperation->GetCreateTable();
+                schemeOperation->MutableCreateView()->CopyFrom(modifyScheme);
+                break;
+            }
+            case ECreateTableQueryCompileResult::WrongDestination: {
+                UNIT_ASSERT_VALUES_EQUAL(transactions->size(), 1);
+                auto* schemeOperation = transactions->Mutable(0)->MutableSchemeOperation();
+                UNIT_ASSERT(schemeOperation->HasCreateTable());
+                auto* modifyScheme = schemeOperation->MutableCreateTable();
+                UNIT_ASSERT(
+                    modifyScheme->GetOperationType() == NKikimrSchemeOp::ESchemeOpCreateTable);
+                modifyScheme->SetWorkingDir("/MyRoot");
+                modifyScheme->MutableCreateTable()->SetName("Escape");
+                break;
+            }
+            }
+
+            auto replacement = NKikimr::NKqp::TKqpCompileResult::Make(
+                result->Uid,
+                result->Status,
+                result->Issues,
+                result->MaxReadType,
+                result->CompilationDuration,
+                result->Query,
+                result->QueryAst,
+                result->CompileMeta,
+                result->NeedToSplit,
+                result->CommandTagName,
+                result->ReplayMessageUserView);
+            replacement->AllowCache = result->AllowCache;
+            replacement->CompiledAt = result->CompiledAt;
+            replacement->PreparedQuery = std::make_shared<NKikimr::NKqp::TPreparedQueryHolder>(
+                preparedQuery,
+                nullptr,
+                true);
+            ev->Get()->CompileResult = std::move(replacement);
+            mutated = true;
+        });
+
+        const ui64 importId = 101;
+        TestImport(runtime, importId, "/MyRoot", Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/Restored"
+              }
+            }
+        )", port));
+
+        env.TestWaitNotification(runtime, importId);
+        const auto response = TestGetImport(
+            runtime, importId, "/MyRoot", Ydb::StatusIds::CANCELLED);
+        UNIT_ASSERT(mutated);
+        UNIT_ASSERT_STRING_CONTAINS(
+            NYql::IssuesFromMessageAsString(response.GetResponse().GetEntry().GetIssues()),
+            expectedError);
+        TestDescribeResult(DescribePath(runtime, "/MyRoot/Restored"), {
+            NLs::PathNotExist,
+        });
+        TestDescribeResult(DescribePath(runtime, "/MyRoot/Escape"), {
+            NLs::PathNotExist,
+        });
+    }
+
+    Y_UNIT_TEST(CreateTableQueryRejectsEmptyKqpResult) {
+        ShouldRejectCreateTableQueryCompileResult(
+            ECreateTableQueryCompileResult::Empty,
+            "expected exactly one physical transaction");
+    }
+
+    Y_UNIT_TEST(CreateTableQueryRejectsMultipleKqpResults) {
+        ShouldRejectCreateTableQueryCompileResult(
+            ECreateTableQueryCompileResult::Multiple,
+            "expected exactly one physical transaction");
+    }
+
+    Y_UNIT_TEST(CreateTableQueryRejectsWrongKqpOperation) {
+        ShouldRejectCreateTableQueryCompileResult(
+            ECreateTableQueryCompileResult::WrongOperation,
+            "expected CREATE TABLE scheme operation");
+    }
+
+    Y_UNIT_TEST(CreateTableQueryRejectsPreparedWrongDestination) {
+        ShouldRejectCreateTableQueryCompileResult(
+            ECreateTableQueryCompileResult::WrongDestination,
+            "does not match destination path");
+    }
+
+    Y_UNIT_TEST(CreationQueryPathTypePersistsAcrossSchemeShardRestart) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableDataShardDirectPartImport(false);
+
+        THashMap<TString, TString> data = {
+            {"/metadata.json", R"({"version": 0})"},
+            {"/create_table.sql", R"(CREATE TABLE `/OldRoot/Original` (
+                key Uint32 NOT NULL,
+                PRIMARY KEY (key)
+            );)"},
+            {"/data_00.csv", "1\n"},
+        };
+
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+        TS3Mock s3Mock(std::move(data), TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        TBlockEvents<NKikimr::NKqp::TEvKqp::TEvCompileRequest> compileBlocker(runtime);
+
+        const ui64 importId = 101;
+        TestImport(runtime, importId, "/MyRoot", Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/Restored"
+              }
+            }
+        )", port));
+
+        runtime.WaitFor("creation query awaiting KQP preparation", [&] {
+            return !compileBlocker.empty();
+        });
+        compileBlocker.Stop();
+        compileBlocker.clear();
+        RebootTablet(runtime, TTestTxConfig::SchemeShard, runtime.AllocateEdgeActor());
+
+        env.TestWaitNotification(runtime, importId);
+        TestGetImport(runtime, importId, "/MyRoot");
+        TestDescribeResult(DescribePath(runtime, "/MyRoot/Restored"), {
+            NLs::PathExist,
+            NLs::IsTable,
         });
     }
 

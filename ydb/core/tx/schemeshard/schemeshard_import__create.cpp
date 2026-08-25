@@ -9,15 +9,11 @@
 #include "schemeshard_xxport__tx_base.h"
 
 #include <ydb/core/base/auth.h>
-#include <ydb/core/base/table_index.h>
 #include <ydb/public/api/protos/ydb_import.pb.h>
 #include <ydb/public/api/protos/ydb_issue_message.pb.h>
 #include <ydb/public/api/protos/ydb_status_codes.pb.h>
 #include <ydb/public/lib/ydb_cli/dump/files/files.h>
-#include <ydb/public/lib/ydb_cli/dump/util/external_data_source_utils.h>
-#include <ydb/public/lib/ydb_cli/dump/util/external_table_utils.h>
-#include <ydb/public/lib/ydb_cli/dump/util/replication_utils.h>
-#include <ydb/public/lib/ydb_cli/dump/util/view_utils.h>
+#include <ydb/public/lib/ydb_cli/dump/util/query_utils.h>
 #include <ydb/public/lib/ydb_cli/dump/util/util.h>
 
 #include <ydb/core/tx/schemeshard/index/index_build_info.h>
@@ -54,19 +50,6 @@ concept HasIndexPopulationMode = requires(const T& t) {
     { t.index_population_mode() } -> std::same_as<Ydb::Import::ImportFromS3Settings::IndexPopulationMode>;
 };
 
-bool PrepareNextBuildableIndex(const TImportInfo& importInfo, ui32 itemIdx, TItem& item) {
-    if (!NeedToBuildIndexes(importInfo, itemIdx) || !item.Table) {
-        return false;
-    }
-
-    while (item.NextIndexIdx < item.Table->indexes_size() &&
-           NTableIndex::IsLocalTableIndex(item.Table->indexes(item.NextIndexIdx).type_case())) {
-        ++item.NextIndexIdx;
-    }
-
-    return item.NextIndexIdx < item.Table->indexes_size();
-}
-
 THashMap<EState, int> CountItemsByState(const TVector<TItem>& items) {
     THashMap<EState, int> counter;
     for (const auto& item : items) {
@@ -86,29 +69,122 @@ bool AllDoneOrWaiting(const THashMap<EState, int>& stateCounts) {
     });
 }
 
-// the item is to be created by query, i.e. it is not a table
+// the item is to be created by query (view, replication, ..., or a table with generated columns)
 bool IsCreatedByQuery(const TItem& item) {
     return !item.CreationQuery.empty();
 }
 
-bool IsCreateViewQuery(const TString& query) {
-    return query.Contains("CREATE VIEW");
+const NKikimrSchemeOp::TTableDescription* GetPreparedTableDesc(
+    const NKikimrSchemeOp::TModifyScheme& modifyScheme)
+{
+    switch (modifyScheme.GetOperationType()) {
+        case NKikimrSchemeOp::ESchemeOpCreateTable:
+            return modifyScheme.HasCreateTable()
+                ? &modifyScheme.GetCreateTable()
+                : nullptr;
+        case NKikimrSchemeOp::ESchemeOpCreateIndexedTable:
+            return modifyScheme.HasCreateIndexedTable() &&
+                    modifyScheme.GetCreateIndexedTable().HasTableDescription()
+                ? &modifyScheme.GetCreateIndexedTable().GetTableDescription()
+                : nullptr;
+        default:
+            return nullptr;
+    }
 }
 
-bool IsCreateReplicationQuery(const TString& query) {
-    return query.Contains("CREATE ASYNC REPLICATION");
+NKikimrSchemeOp::TTableDescription* GetPreparedTableDesc(
+    NKikimrSchemeOp::TModifyScheme& modifyScheme)
+{
+    switch (modifyScheme.GetOperationType()) {
+        case NKikimrSchemeOp::ESchemeOpCreateTable:
+            return modifyScheme.HasCreateTable()
+                ? modifyScheme.MutableCreateTable()
+                : nullptr;
+        case NKikimrSchemeOp::ESchemeOpCreateIndexedTable:
+            return modifyScheme.HasCreateIndexedTable() &&
+                    modifyScheme.GetCreateIndexedTable().HasTableDescription()
+                ? modifyScheme.MutableCreateIndexedTable()->MutableTableDescription()
+                : nullptr;
+        default:
+            return nullptr;
+    }
 }
 
-bool IsCreateTransferQuery(const TString& query) {
-    return query.Contains("CREATE TRANSFER");
+bool IsTableCreationOperation(const NKikimrSchemeOp::TModifyScheme& modifyScheme) {
+    return IsIn({
+        NKikimrSchemeOp::ESchemeOpCreateTable,
+        NKikimrSchemeOp::ESchemeOpCreateIndexedTable,
+    }, modifyScheme.GetOperationType());
 }
 
-bool IsCreateExternalDataSourceQuery(const TString& query) {
-    return query.Contains("CREATE EXTERNAL DATA SOURCE");
+bool IsTableCreatedByQuery(const TItem& item) {
+    return item.PreparedCreationQuery && GetPreparedTableDesc(*item.PreparedCreationQuery);
 }
 
-bool IsCreateExternalTableQuery(const TString& query) {
-    return query.Contains("CREATE EXTERNAL TABLE");
+TMaybe<NKikimrSchemeOp::EPathType> GetCreationQueryPathType(
+    NYdb::NDump::ESchemeCreateQueryType queryType)
+{
+    switch (queryType) {
+    case NYdb::NDump::ESchemeCreateQueryType::Table:
+        return NKikimrSchemeOp::EPathTypeTable;
+    case NYdb::NDump::ESchemeCreateQueryType::View:
+        return NKikimrSchemeOp::EPathTypeView;
+    case NYdb::NDump::ESchemeCreateQueryType::Replication:
+        return NKikimrSchemeOp::EPathTypeReplication;
+    case NYdb::NDump::ESchemeCreateQueryType::Transfer:
+        return NKikimrSchemeOp::EPathTypeTransfer;
+    case NYdb::NDump::ESchemeCreateQueryType::ExternalDataSource:
+        return NKikimrSchemeOp::EPathTypeExternalDataSource;
+    case NYdb::NDump::ESchemeCreateQueryType::ExternalTable:
+        return NKikimrSchemeOp::EPathTypeExternalTable;
+    }
+    return Nothing();
+}
+
+TStringBuf GetExpectedCreateOperationName(
+    NKikimrSchemeOp::EPathType creationQueryPathType)
+{
+    switch (creationQueryPathType) {
+    case NKikimrSchemeOp::EPathTypeTable:
+        return "CREATE TABLE";
+    case NKikimrSchemeOp::EPathTypeView:
+        return "CREATE VIEW";
+    case NKikimrSchemeOp::EPathTypeReplication:
+        return "CREATE ASYNC REPLICATION";
+    case NKikimrSchemeOp::EPathTypeTransfer:
+        return "CREATE TRANSFER";
+    case NKikimrSchemeOp::EPathTypeExternalDataSource:
+        return "CREATE EXTERNAL DATA SOURCE";
+    case NKikimrSchemeOp::EPathTypeExternalTable:
+        return "CREATE EXTERNAL TABLE";
+    default:
+        return {};
+    }
+}
+
+bool ValidateCreationQueryPathType(
+    const TString& query,
+    NKikimrSchemeOp::EPathType expectedPathType,
+    NYql::TIssues& issues)
+{
+    const TStringBuf expectedOperation =
+        GetExpectedCreateOperationName(expectedPathType);
+    if (!expectedOperation) {
+        issues.AddIssue("missing persisted creation-query path type; restart the import");
+        return false;
+    }
+
+    const auto queryType = NYdb::NDump::ClassifySchemeCreateQuery(query, issues);
+    if (!queryType) {
+        return false;
+    }
+
+    if (GetCreationQueryPathType(*queryType) != expectedPathType) {
+        issues.AddIssue(TStringBuilder()
+            << "expected " << expectedOperation << " scheme operation");
+        return false;
+    }
+    return true;
 }
 
 bool RewriteCreateQuery(
@@ -117,20 +193,7 @@ bool RewriteCreateQuery(
     const TString& dbPath,
     NYql::TIssues& issues)
 {
-    if (IsCreateViewQuery(query)) {
-        return NYdb::NDump::RewriteCreateViewQuery(query, dbRestoreRoot, true, dbPath, issues);
-    } else if (IsCreateReplicationQuery(query)) {
-        return NYdb::NDump::RewriteCreateAsyncReplicationQuery(query, dbRestoreRoot, dbPath, issues);
-    } else if (IsCreateTransferQuery(query)) {
-        return NYdb::NDump::RewriteCreateTransferQuery(query, dbRestoreRoot, dbPath, issues);
-    } else if (IsCreateExternalDataSourceQuery(query)) {
-        return NYdb::NDump::RewriteCreateExternalDataSourceQuery(query, dbRestoreRoot, dbPath, issues);
-    } else if (IsCreateExternalTableQuery(query)) {
-        return NYdb::NDump::RewriteCreateExternalTableQuery(query, dbRestoreRoot, dbPath, issues);
-    }
-
-    issues.AddIssue(TStringBuilder() << "unsupported create query: " << query);
-    return false;
+    return NYdb::NDump::RewriteSchemeCreateQuery(query, dbRestoreRoot, dbPath, issues);
 }
 
 TString GetDatabase(TSchemeShard& ss) {
@@ -734,9 +797,35 @@ private:
         return true;
     }
 
-    void ExecutePreparedQuery(TTransactionContext& txc, TImportInfo::TPtr importInfo, ui32 itemIdx, TTxId txId) {
+    bool ExecutePreparedQuery(TTransactionContext& txc, TImportInfo::TPtr importInfo, ui32 itemIdx, TTxId txId) {
         Y_ABORT_UNLESS(itemIdx < importInfo->Items.size());
         auto& item = importInfo->Items[itemIdx];
+
+        if (!item.PreparedCreationQuery) {
+            NIceDb::TNiceDb db(txc.DB);
+            CancelAndPersist(db, importInfo, itemIdx,
+                "Creation query has not been prepared", "invalid prepared creation query");
+            return false;
+        }
+
+        if (TString error; !ValidatePreparedIndexes(*importInfo, itemIdx, error)) {
+            NIceDb::TNiceDb db(txc.DB);
+            CancelAndPersist(db, importInfo, itemIdx, error, "invalid prepared index population");
+            return false;
+        }
+
+        const auto preparedTargetPath =
+            GetPreparedQueryTargetPath(*item.PreparedCreationQuery);
+        const TString canonicalDestination = CanonizePath(item.DstPathName);
+        if (!preparedTargetPath || *preparedTargetPath != canonicalDestination) {
+            NIceDb::TNiceDb db(txc.DB);
+            CancelAndPersist(db, importInfo, itemIdx, TStringBuilder()
+                << "Prepared creation query target path "
+                << (preparedTargetPath ? preparedTargetPath->Quote() : "<unknown>")
+                << " does not match destination path " << canonicalDestination.Quote(),
+                "invalid prepared creation query");
+            return false;
+        }
 
         item.SubState = ESubState::Proposed;
 
@@ -753,6 +842,42 @@ private:
 
         auto& modifyScheme = *record.AddTransaction();
         modifyScheme = *item.PreparedCreationQuery;
+
+        if (IsTableCreationOperation(modifyScheme)) {
+            auto* tableDesc = GetPreparedTableDesc(modifyScheme);
+            if (!tableDesc) {
+                NIceDb::TNiceDb db(txc.DB);
+                CancelAndPersist(db, importInfo, itemIdx,
+                    "Prepared CREATE TABLE operation has no table description",
+                    "invalid prepared creation query");
+                return false;
+            }
+
+            tableDesc->SetIsRestore(true);
+            if (const auto& attributes = item.Metadata.GetTableUserAttributes()) {
+                auto* alterUserAttributes = modifyScheme.MutableAlterUserAttributes();
+                for (const auto& attribute : *attributes) {
+                    auto* userAttribute = alterUserAttributes->AddUserAttributes();
+                    userAttribute->SetKey(attribute.Key);
+                    userAttribute->SetValue(attribute.Value);
+                }
+            }
+
+            if (modifyScheme.GetOperationType() == NKikimrSchemeOp::ESchemeOpCreateIndexedTable &&
+                NeedToBuildIndexes(*importInfo, itemIdx)) {
+                // Global indexes are populated after the base-table data transfer. Local indexes
+                // cannot be populated by the index builder, so they must remain in the CREATE op.
+                auto* executableIndexes =
+                    modifyScheme.MutableCreateIndexedTable()->MutableIndexDescription();
+                executableIndexes->Clear();
+                for (const auto& index :
+                     item.PreparedCreationQuery->GetCreateIndexedTable().GetIndexDescription()) {
+                    if (IsLocalPreparedIndex(index)) {
+                        executableIndexes->Add()->CopyFrom(index);
+                    }
+                }
+            }
+        }
         modifyScheme.SetInternal(true);
 
         if (importInfo->UserSID) {
@@ -764,10 +889,12 @@ private:
 
         if (TString error; !FillACL(modifyScheme, item.Permissions, error)) {
             NIceDb::TNiceDb db(txc.DB);
-            return CancelAndPersist(db, importInfo, itemIdx, error, "cannot parse permissions");
+            CancelAndPersist(db, importInfo, itemIdx, error, "cannot parse permissions");
+            return false;
         }
 
         Send(Self->SelfId(), std::move(propose));
+        return true;
     }
 
     void DelayObjectCreation(
@@ -809,7 +936,8 @@ private:
                 AllocateTxId(importInfo, itemIdx);
             } else {
                 item.SchemeQueryExecutor = ctx.Register(CreateSchemeQueryExecutor(
-                    Self->SelfId(), importInfo.Id, itemIdx, item.CreationQuery, database
+                    Self->SelfId(), importInfo.Id, itemIdx, item.CreationQuery,
+                    item.CreationQueryPathType, item.DstPathName, database
                 ));
                 Self->RunningImportSchemeQueryExecutors.emplace(item.SchemeQueryExecutor);
             }
@@ -865,7 +993,7 @@ private:
         return true;
     }
 
-    void BuildIndex(TImportInfo& importInfo, ui32 itemIdx, TTxId txId) {
+    bool BuildIndex(TImportInfo& importInfo, ui32 itemIdx, TTxId txId, TString& error) {
         Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
         auto& item = importInfo.Items.at(itemIdx);
 
@@ -877,7 +1005,14 @@ private:
             << ", txId# " << txId);
 
         Y_ABORT_UNLESS(item.WaitTxId == InvalidTxId);
-        Send(Self->SelfId(), BuildIndexPropose(Self, txId, importInfo, itemIdx, MakeIndexBuildUid(importInfo, itemIdx)));
+        auto propose = BuildIndexPropose(
+            Self, txId, importInfo, itemIdx, MakeIndexBuildUid(importInfo, itemIdx), error);
+        if (!propose) {
+            return false;
+        }
+
+        Send(Self->SelfId(), std::move(propose));
+        return true;
     }
 
     bool CancelIndexBuilding(TImportInfo& importInfo, ui32 itemIdx) {
@@ -1120,7 +1255,7 @@ private:
     }
 
     TMaybe<TString> GetIssues(const TImportInfo::TItem& item, TTxId restoreTxId) {
-        if (item.Table->store_type() == Ydb::Table::STORE_TYPE_COLUMN) {
+        if (item.Table && item.Table->store_type() == Ydb::Table::STORE_TYPE_COLUMN) {
             Y_ABORT_UNLESS(Self->ColumnTables.contains(item.DstPathId));
             TColumnTableInfo::TPtr table = Self->ColumnTables.at(item.DstPathId).GetPtr();
             return GetIssues(table, restoreTxId);
@@ -1222,6 +1357,18 @@ private:
 
         NIceDb::TNiceDb db(txc.DB);
 
+        if (importInfo->State == EState::Waiting
+            && IsCreatedByQuery(item)
+            && item.CreationQueryPathType == NKikimrSchemeOp::EPathTypeInvalid)
+        {
+            return CancelAndPersist(
+                db,
+                importInfo,
+                itemIdx,
+                "missing persisted creation-query path type; restart the import",
+                "invalid creation query");
+        }
+
         switch (importInfo->State) {
             case EState::Waiting: {
                 switch (item.State) {
@@ -1243,7 +1390,8 @@ private:
                         } else {
                             const auto database = GetDatabase(*Self);
                             item.SchemeQueryExecutor = ctx.Register(CreateSchemeQueryExecutor(
-                                Self->SelfId(), importInfo->Id, itemIdx, item.CreationQuery, database
+                                Self->SelfId(), importInfo->Id, itemIdx, item.CreationQuery,
+                                item.CreationQueryPathType, item.DstPathName, database
                             ));
                             Self->RunningImportSchemeQueryExecutors.emplace(item.SchemeQueryExecutor);
                         }
@@ -1343,13 +1491,32 @@ private:
             const TString source = TStringBuilder() << item.SrcPath;
 
             NYql::TIssues issues;
+            if (!ValidateCreationQueryPathType(
+                    item.CreationQuery,
+                    item.CreationQueryPathType,
+                    issues))
+            {
+                issues.AddIssue(TStringBuilder() << "path: " << source);
+                return CancelAndPersist(
+                    db, importInfo, msg.ItemIdx, issues.ToString(), "invalid creation query");
+            }
             if (!RewriteCreateQuery(item.CreationQuery, database, item.DstPathName, issues)) {
                 issues.AddIssue(TStringBuilder() << "path: " << source);
                 return CancelAndPersist(db, importInfo, msg.ItemIdx, issues.ToString(), "invalid creation query");
             }
+            if (!ValidateCreationQueryPathType(
+                    item.CreationQuery,
+                    item.CreationQueryPathType,
+                    issues))
+            {
+                issues.AddIssue(TStringBuilder() << "path: " << source);
+                return CancelAndPersist(
+                    db, importInfo, msg.ItemIdx, issues.ToString(), "invalid creation query");
+            }
 
             item.SchemeQueryExecutor = ctx.Register(CreateSchemeQueryExecutor(
-                Self->SelfId(), msg.ImportId, msg.ItemIdx, item.CreationQuery, database
+                Self->SelfId(), msg.ImportId, msg.ItemIdx, item.CreationQuery,
+                item.CreationQueryPathType, item.DstPathName, database
             ));
             Self->RunningImportSchemeQueryExecutors.emplace(item.SchemeQueryExecutor);
         } else if (item.Table) {
@@ -1549,7 +1716,9 @@ private:
             switch (item.State) {
             case EState::CreateSchemeObject:
                 if (item.PreparedCreationQuery) {
-                    ExecutePreparedQuery(txc, importInfo, i, txId);
+                    if (!ExecutePreparedQuery(txc, importInfo, i, txId)) {
+                        return;
+                    }
                     itemIdx = i;
                     break;
                 }
@@ -1591,7 +1760,11 @@ private:
                 break;
 
             case EState::BuildIndexes:
-                BuildIndex(*importInfo, i, txId);
+                if (TString error; !BuildIndex(*importInfo, i, txId, error)) {
+                    NIceDb::TNiceDb db(txc.DB);
+                    CancelAndPersist(db, importInfo, i, error, "cannot build prepared index");
+                    return;
+                }
                 itemIdx = i;
                 break;
 
@@ -1668,7 +1841,15 @@ private:
         if (record.GetStatus() == NKikimrScheme::StatusSuccess) {
             Self->TxIdToImport.erase(txId);
             txId = InvalidTxId;
-            item.State = EState::Done;
+            if (item.State == EState::CreateSchemeObject && IsTableCreatedByQuery(item)) {
+                TString error;
+                if (!StartTableDataTransfer(db, *importInfo, itemIdx, error)) {
+                    return CancelAndPersist(db, importInfo, itemIdx, error,
+                        "cannot start table data transfer");
+                }
+            } else {
+                item.State = EState::Done;
+            }
         } else if (record.GetStatus() != NKikimrScheme::StatusAccepted) {
             Self->TxIdToImport.erase(txId);
             txId = InvalidTxId;
@@ -1721,9 +1902,10 @@ private:
         }
 
         if (item.State == EState::Done || item.State == EState::CreateSchemeObject) {
-            UpdateItemDstPathId(db, *importInfo, itemIdx);
-            for (auto childIdx : item.ChildItems) {
-                UpdateItemDstPathId(db, *importInfo, childIdx);
+            TString error;
+            if (!UpdateItemDstPathIds(db, *importInfo, itemIdx, error)) {
+                return CancelAndPersist(db, importInfo, itemIdx, error,
+                    "cannot resolve created scheme object");
             }
         }
 
@@ -1746,15 +1928,68 @@ private:
         }
     }
 
-    void UpdateItemDstPathId(NIceDb::TNiceDb& db, TImportInfo& importInfo, ui32 itemIdx) {
+    bool UpdateItemDstPathId(
+        NIceDb::TNiceDb& db,
+        TImportInfo& importInfo,
+        ui32 itemIdx,
+        TString& error)
+    {
         Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
         auto& item = importInfo.Items.at(itemIdx);
 
         auto path = TPath::Resolve(item.DstPathName, Self);
-        Y_ABORT_UNLESS(path);
+        if (!path.IsResolved()) {
+            error = TStringBuilder()
+                << "Created destination path is not resolved: " << item.DstPathName;
+            return false;
+        }
 
         item.DstPathId = path.Base()->PathId;
         Self->PersistImportItemDstPathId(db, importInfo, itemIdx);
+        return true;
+    }
+
+    bool UpdateItemDstPathIds(
+        NIceDb::TNiceDb& db,
+        TImportInfo& importInfo,
+        ui32 itemIdx,
+        TString& error)
+    {
+        if (!UpdateItemDstPathId(db, importInfo, itemIdx, error)) {
+            return false;
+        }
+
+        const auto& item = importInfo.Items.at(itemIdx);
+        for (auto childIdx : item.ChildItems) {
+            if (!UpdateItemDstPathId(db, importInfo, childIdx, error)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool StartTableDataTransfer(
+        NIceDb::TNiceDb& db,
+        TImportInfo& importInfo,
+        ui32 itemIdx,
+        TString& error)
+    {
+        if (!UpdateItemDstPathIds(db, importInfo, itemIdx, error)) {
+            return false;
+        }
+
+        auto& item = importInfo.Items.at(itemIdx);
+        for (auto childIdx : item.ChildItems) {
+            auto& childItem = importInfo.Items.at(childIdx);
+            childItem.State = EState::Transferring;
+            Self->PersistImportItemState(db, importInfo, childIdx);
+            AllocateTxId(importInfo, childIdx);
+        }
+
+        item.State = EState::Transferring;
+        AllocateTxId(importInfo, itemIdx);
+        return true;
     }
 
     void OnCreateIndexResult(TTransactionContext& txc, const TActorContext&) {
@@ -1865,29 +2100,26 @@ private:
         Self->TxIdToImport.erase(txId);
 
         switch (item.State) {
-        case EState::CreateSchemeObject:
-            if (IsCreatedByQuery(item)) {
+        case EState::CreateSchemeObject: {
+            const bool tableCreatedByQuery = IsTableCreatedByQuery(item);
+            if (IsCreatedByQuery(item) && !tableCreatedByQuery) {
                 item.State = EState::Done;
                 break;
             } else if (item.Topic) {
                 item.State = EState::Done;
                 break;
             }
-            if (item.Table) {
-                for (auto childIdx : item.ChildItems) {
-                    Y_ABORT_UNLESS(childIdx < importInfo->Items.size());
-                    auto& childItem = importInfo->Items.at(childIdx);
-
-                    childItem.State = EState::Transferring;
-                    Self->PersistImportItemState(db, *importInfo, childIdx);
-                    AllocateTxId(*importInfo, childIdx);
+            if (item.Table || tableCreatedByQuery) {
+                TString error;
+                if (!StartTableDataTransfer(db, *importInfo, itemIdx, error)) {
+                    return CancelAndPersist(db, importInfo, itemIdx, error,
+                        "cannot start table data transfer");
                 }
             } else {
                 Y_ABORT("Create Scheme Object: schema objects are empty");
             }
-            item.State = EState::Transferring;
-            AllocateTxId(*importInfo, itemIdx);
             break;
+        }
 
         case EState::Transferring:
             if (const auto issue = GetIssues(item, txId)) {
@@ -1895,9 +2127,13 @@ private:
                 Cancel(*importInfo, itemIdx, "issues during restore " + *issue);
                 Self->EraseEncryptionKey(db, *importInfo);
             } else {
-                if (PrepareNextBuildableIndex(*importInfo, itemIdx, item)) {
+                TString error;
+                if (PrepareNextBuildableIndex(*importInfo, itemIdx, item, error)) {
                     item.State = EState::BuildIndexes;
                     AllocateTxId(*importInfo, itemIdx);
+                } else if (!error.empty()) {
+                    return CancelAndPersist(db, importInfo, itemIdx, error,
+                        "invalid prepared index");
                 } else if (item.NextChangefeedIdx < item.Changefeeds.changefeeds_size() &&
                            AppData()->FeatureFlags.GetEnableChangefeedsImport()) {
                     item.State = EState::CreateChangefeed;
@@ -1914,11 +2150,13 @@ private:
                 Cancel(*importInfo, itemIdx, "issues during index building");
                 Self->EraseEncryptionKey(db, *importInfo);
             } else {
-                if (item.Table) {
-                    ++item.NextIndexIdx;
-                }
-                if (PrepareNextBuildableIndex(*importInfo, itemIdx, item)) {
+                ++item.NextIndexIdx;
+                TString error;
+                if (PrepareNextBuildableIndex(*importInfo, itemIdx, item, error)) {
                     AllocateTxId(*importInfo, itemIdx);
+                } else if (!error.empty()) {
+                    return CancelAndPersist(db, importInfo, itemIdx, error,
+                        "invalid prepared index");
                 } else if (item.NextChangefeedIdx < item.Changefeeds.changefeeds_size() &&
                            AppData()->FeatureFlags.GetEnableChangefeedsImport()) {
                     item.State = EState::CreateChangefeed;

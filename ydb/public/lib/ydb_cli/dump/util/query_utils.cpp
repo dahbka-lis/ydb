@@ -1,5 +1,11 @@
 #include "query_utils.h"
 
+#include "external_data_source_utils.h"
+#include "external_table_utils.h"
+#include "replication_utils.h"
+#include "table_utils.h"
+#include "view_utils.h"
+
 #include <yql/essentials/parser/proto_ast/gen/v1_antlr4/SQLv1Antlr4Lexer.h>
 #include <yql/essentials/parser/proto_ast/gen/v1_proto_split_antlr4/SQLv1Antlr4Parser.pb.main.h>
 #include <yql/essentials/sql/settings/translation_settings.h>
@@ -380,6 +386,80 @@ bool RewriteCreateQuery(TString& query, std::string_view pattern, const std::str
 
     issues.AddIssue(TStringBuilder() << "Pattern: \"" << pattern << "\" was not found: " << query.Quote());
     return false;
+}
+
+TMaybe<ESchemeCreateQueryType> ClassifySchemeCreateQuery(
+    const TString& query,
+    NYql::TIssues& issues)
+{
+    TRule_sql_query queryProto;
+    if (!SqlToProtoAst(query, queryProto, issues)) {
+        return Nothing();
+    }
+
+    TVector<ESchemeCreateQueryType> types;
+    std::function<bool(const NProtoBuf::Message&)> collect = [&types](const NProtoBuf::Message& message) {
+        if (dynamic_cast<const TRule_create_view_stmt*>(&message)) {
+            types.push_back(ESchemeCreateQueryType::View);
+            return false;
+        }
+        if (dynamic_cast<const TRule_create_replication_stmt*>(&message)) {
+            types.push_back(ESchemeCreateQueryType::Replication);
+            return false;
+        }
+        if (dynamic_cast<const TRule_create_transfer_stmt*>(&message)) {
+            types.push_back(ESchemeCreateQueryType::Transfer);
+            return false;
+        }
+        if (dynamic_cast<const TRule_create_external_data_source_stmt*>(&message)) {
+            types.push_back(ESchemeCreateQueryType::ExternalDataSource);
+            return false;
+        }
+        if (const auto* createTable = dynamic_cast<const TRule_create_table_stmt*>(&message)) {
+            if (createTable->GetBlock3().HasAlt3()) {
+                types.push_back(ESchemeCreateQueryType::ExternalTable);
+            } else if (createTable->GetBlock3().HasAlt1()) {
+                types.push_back(ESchemeCreateQueryType::Table);
+            }
+            return false;
+        }
+        return true;
+    };
+    VisitAllFields(queryProto, collect);
+
+    if (types.size() != 1) {
+        issues.AddIssue(TStringBuilder()
+            << "expected exactly one supported CREATE statement, found " << types.size());
+        return Nothing();
+    }
+    return types.front();
+}
+
+bool RewriteSchemeCreateQuery(
+    TString& query,
+    const TString& restoreRoot,
+    const TString& dstPath,
+    NYql::TIssues& issues)
+{
+    const auto type = ClassifySchemeCreateQuery(query, issues);
+    if (!type) {
+        return false;
+    }
+
+    switch (*type) {
+        case ESchemeCreateQueryType::View:
+            return RewriteCreateViewQuery(query, restoreRoot, true, dstPath, issues);
+        case ESchemeCreateQueryType::Replication:
+            return RewriteCreateAsyncReplicationQuery(query, restoreRoot, dstPath, issues);
+        case ESchemeCreateQueryType::Transfer:
+            return RewriteCreateTransferQuery(query, restoreRoot, dstPath, issues);
+        case ESchemeCreateQueryType::ExternalDataSource:
+            return RewriteCreateExternalDataSourceQuery(query, restoreRoot, dstPath, issues);
+        case ESchemeCreateQueryType::ExternalTable:
+            return RewriteCreateExternalTableQuery(query, restoreRoot, dstPath, issues);
+        case ESchemeCreateQueryType::Table:
+            return RewriteCreateTableQuery(query, restoreRoot, dstPath, issues);
+    }
 }
 
 std::string KeyValueToString(std::string_view key, std::string_view value) {

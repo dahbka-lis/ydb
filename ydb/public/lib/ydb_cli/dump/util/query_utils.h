@@ -30,6 +30,25 @@ bool RewriteTableRefs(TString& query, TStringBuf backupRoot, TStringBuf restoreR
 bool RewriteObjectRefs(TString& query, TStringBuf restoreRoot, NYql::TIssues& issues);
 bool RewriteCreateQuery(TString& query, std::string_view pattern, const std::string& dbPath, NYql::TIssues& issues);
 
+enum class ESchemeCreateQueryType {
+    Table,
+    View,
+    Replication,
+    Transfer,
+    ExternalDataSource,
+    ExternalTable,
+};
+
+TMaybe<ESchemeCreateQueryType> ClassifySchemeCreateQuery(
+    const TString& query,
+    NYql::TIssues& issues);
+
+bool RewriteSchemeCreateQuery(
+    TString& query,
+    const TString& restoreRoot,
+    const TString& dstPath,
+    NYql::TIssues& issues);
+
 TString GetBackupRoot(const TString& query);
 TString GetDatabase(const TString& query);
 TVector<TSecretSetting> GetSecretSettings(const TString& query);

@@ -5275,6 +5275,9 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
 
                     if (rowset.HaveValue<Schema::ImportItems::CreationQuery>()) {
                         item.CreationQuery = rowset.GetValue<Schema::ImportItems::CreationQuery>();
+                        item.CreationQueryPathType = rowset.GetValueOrDefault<
+                            Schema::ImportItems::CreationQueryPathType>(
+                                NKikimrSchemeOp::EPathTypeInvalid);
                     }
 
                     if (rowset.HaveValue<Schema::ImportItems::PreparedCreationQuery>()) {

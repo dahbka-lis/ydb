@@ -664,6 +664,8 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
 
         if (IsCreatedByQuery(SchemeKey)) {
             item.CreationQuery = content;
+            item.CreationQueryPathType =
+                GetXxportProperties().at(SchemePropertiesIdx).PathType;
         } else if (IsTopic(SchemeKey)) {
             Ydb::Topic::CreateTopicRequest request;
             if (!google::protobuf::TextFormat::ParseFromString(content, &request)) {
