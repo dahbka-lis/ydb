@@ -771,12 +771,21 @@ public:
         }
 
         if (TxType == TTxState::TxBackup && context.SS->Tables.contains(path.Base()->PathId)) {
+            const auto& backup = Transaction.GetBackup();
             TTableInfo::TPtr table = context.SS->Tables.at(path.Base()->PathId);
             for (const auto& [_, column] : table->Columns) {
                 if (column.DefaultKind == ETableColumnDefaultKind::FromExpression && !column.IsDropped()) {
-                    result->SetError(NKikimrScheme::StatusPreconditionFailed,
-                        TStringBuilder() << "Cannot backup table with generated column '" << column.Name << "'");
-                    return result;
+                    if (backup.HasYTSettings()) {
+                        result->SetError(NKikimrScheme::StatusPreconditionFailed,
+                            TStringBuilder() << "Cannot backup table with generated column '" << column.Name << "' to YT");
+                        return result;
+                    }
+                    if ((backup.HasS3Settings() || backup.HasFSSettings()) && backup.GetCreateTableQuery().empty()) {
+                        result->SetError(NKikimrScheme::StatusPreconditionFailed,
+                            TStringBuilder() << "Cannot backup table with generated column '" << column.Name
+                                << "' without create table query");
+                        return result;
+                    }
                 }
             }
         }

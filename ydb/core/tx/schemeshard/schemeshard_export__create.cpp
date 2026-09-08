@@ -440,7 +440,7 @@ struct TSchemeShard::TExport::TTxProgress: public TSchemeShard::TXxport::TTxBase
         LOG_D("TExport::TTxProgress: DoExecute");
 
         if (AllocateResult) {
-            OnAllocateResult();
+            OnAllocateResult(txc);
         } else if (ModifyResult) {
             OnModifyResult(txc, ctx);
         } else if (SchemeUploadResult) {
@@ -479,20 +479,43 @@ private:
         Send(Self->SelfId(), CopyTablesPropose(Self, txId, exportInfo));
     }
 
-    void TransferData(TExportInfo& exportInfo, ui32 itemIdx, TTxId txId) {
-        Y_ABORT_UNLESS(itemIdx < exportInfo.Items.size());
-        auto& item = exportInfo.Items[itemIdx];
-
-        item.SubState = ESubState::Proposed;
+    bool TransferData(
+            const TExportInfo::TPtr& exportInfo,
+            ui32 itemIdx,
+            TTxId txId,
+            TTransactionContext& txc) {
+        Y_ABORT_UNLESS(itemIdx < exportInfo->Items.size());
+        auto& item = exportInfo->Items[itemIdx];
 
         LOG_I("TExport::TTxProgress: Backup propose"
-            << ": info# " << exportInfo.ToString()
+            << ": info# " << exportInfo->ToString()
             << ", item# " << item.ToString(itemIdx)
             << ", txId# " << txId
         );
 
         Y_ABORT_UNLESS(item.WaitTxId == InvalidTxId);
-        Send(Self->SelfId(), BackupPropose(Self, txId, exportInfo, itemIdx));
+        TString error;
+        auto propose = BackupPropose(Self, txId, *exportInfo, itemIdx, error);
+        if (!propose) {
+            NIceDb::TNiceDb db(txc.DB);
+            item.State = EState::Cancelled;
+            item.Issue = std::move(error);
+            Self->PersistExportItemState(db, *exportInfo, itemIdx);
+
+            if (!exportInfo->IsInProgress()) {
+                return false;
+            }
+
+            Cancel(*exportInfo, itemIdx, "backup proposal construction failed");
+            Self->PersistExportState(db, *exportInfo);
+            Self->EraseEncryptionKey(db, *exportInfo);
+            SendNotificationsIfFinished(exportInfo);
+            return false;
+        }
+
+        item.SubState = ESubState::Proposed;
+        Send(Self->SelfId(), std::move(propose));
+        return true;
     }
 
     template <typename Func>
@@ -1056,7 +1079,7 @@ private:
         AuditLogExportEnd(*exportInfo, Self);
     }
 
-    void OnAllocateResult() {
+    void OnAllocateResult(TTransactionContext& txc) {
         Y_ABORT_UNLESS(AllocateResult);
 
         const auto txId = TTxId(AllocateResult->Get()->TxIds.front());
@@ -1090,7 +1113,9 @@ private:
             }
             itemIdx = PopFront(exportInfo->PendingItems);
             if (IsPathTypeTransferrable(exportInfo->Items.at(itemIdx))) {
-                TransferData(*exportInfo, itemIdx, txId);
+                if (!TransferData(exportInfo, itemIdx, txId, txc)) {
+                    return;
+                }
             } else {
                 LOG_W("TExport::TTxProgress: OnAllocateResult allocated a needless txId for an item transferring"
                     << ": id# " << id

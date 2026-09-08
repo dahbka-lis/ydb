@@ -1455,6 +1455,70 @@ Y_UNIT_TEST_SUITE(IncrementalBackup) {
         UNIT_ASSERT_VALUES_EQUAL(expected, actual);
     }
 
+    Y_UNIT_TEST(E2EBackupCollectionWithGeneratedColumns) {
+        TPortManager portManager;
+        TServer::TPtr server = new TServer(TServerSettings(portManager.GetPort(2134), {}, DefaultPQConfig())
+            .SetUseRealThreads(false)
+            .SetDomainName("Root")
+            .SetEnableChangefeedInitialScan(true)
+            .SetEnableBackupService(true)
+            .SetFeatureFlags([] {
+                NKikimrConfig::TFeatureFlags flags;
+                flags.SetEnableGeneratedStored(true);
+                return flags;
+            }())
+        );
+
+        auto& runtime = *server->GetRuntime();
+        const auto edgeActor = runtime.AllocateEdgeActor();
+
+        SetupLogging(runtime);
+        InitRoot(server, edgeActor);
+
+        ExecSQL(server, edgeActor, R"(
+            CREATE TABLE `/Root/GenTable` (
+                key Uint32 NOT NULL,
+                a Int32,
+                b Int32,
+                sum Int32 GENERATED ALWAYS AS (COALESCE(a, 0) + COALESCE(b, 0)) STORED,
+                PRIMARY KEY (key)
+            );
+        )", false);
+
+        ExecSQL(server, edgeActor, R"(
+            UPSERT INTO `/Root/GenTable` (key, a, b) VALUES (1, 1, 10), (2, 2, 20), (3, 3, 30);
+        )");
+
+        ExecSQL(server, edgeActor, R"(
+            CREATE BACKUP COLLECTION `GenCollection`
+              ( TABLE `/Root/GenTable` )
+            WITH ( STORAGE = 'cluster', INCREMENTAL_BACKUP_ENABLED = 'true' );
+        )", false);
+
+        ExecSQL(server, edgeActor, R"(BACKUP `GenCollection`;)", false);
+        SimulateSleep(server, TDuration::Seconds(2));
+
+        ExecSQL(server, edgeActor, R"(UPSERT INTO `/Root/GenTable` (key, a, b) VALUES (2, 200, 20);)");
+        ExecSQL(server, edgeActor, R"(DELETE FROM `/Root/GenTable` WHERE key=1;)");
+
+        ExecSQL(server, edgeActor, R"(BACKUP `GenCollection` INCREMENTAL;)", false);
+        SimulateSleep(server, TDuration::Seconds(5));
+
+        auto expected = KqpSimpleExec(runtime, R"(SELECT key, a, b, sum FROM `/Root/GenTable` ORDER BY key)");
+
+        ExecSQL(server, edgeActor, R"(DROP TABLE `/Root/GenTable`;)", false);
+        ExecSQL(server, edgeActor, R"(RESTORE `GenCollection`;)", false);
+        runtime.SimulateSleep(TDuration::Seconds(5));
+
+        auto actual = KqpSimpleExec(runtime, R"(SELECT key, a, b, sum FROM `/Root/GenTable` ORDER BY key)");
+        UNIT_ASSERT_VALUES_EQUAL(expected, actual);
+
+        ExecSQL(server, edgeActor, R"(UPSERT INTO `/Root/GenTable` (key, a, b) VALUES (10, 5, 7);)");
+        auto recomputed = KqpSimpleExec(runtime,
+            R"(SELECT sum FROM `/Root/GenTable` WHERE key = 10)");
+        UNIT_ASSERT_VALUES_EQUAL(recomputed, "{ items { int32_value: 12 } }");
+    }
+
     Y_UNIT_TEST(MultiShardIncrementalRestore) {
         TPortManager portManager;
         TServer::TPtr server = new TServer(TServerSettings(portManager.GetPort(2134), {}, DefaultPQConfig())

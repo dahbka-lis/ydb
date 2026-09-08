@@ -27,6 +27,21 @@ THolder<TEvSchemeShard::TEvModifySchemeTransaction> RestoreTableDataPropose(
     ui32 itemIdx
 );
 
+bool IsLocalPreparedIndex(const NKikimrSchemeOp::TIndexCreationConfig& index);
+
+bool ValidatePreparedIndexes(
+    const TImportInfo& importInfo,
+    ui32 itemIdx,
+    TString& error
+);
+
+bool PrepareNextBuildableIndex(
+    const TImportInfo& importInfo,
+    ui32 itemIdx,
+    TImportInfo::TItem& item,
+    TString& error
+);
+
 THolder<TEvSchemeShard::TEvCancelTx> CancelRestoreTableDataPropose(
     const TImportInfo& importInfo,
     TTxId restoreTxId
@@ -37,7 +52,8 @@ THolder<TEvIndexBuilder::TEvCreateRequest> BuildIndexPropose(
     TTxId txId,
     const TImportInfo& importInfo,
     ui32 itemIdx,
-    const TString& uid
+    const TString& uid,
+    TString& error
 );
 
 THolder<TEvIndexBuilder::TEvCancelRequest> CancelIndexBuildPropose(

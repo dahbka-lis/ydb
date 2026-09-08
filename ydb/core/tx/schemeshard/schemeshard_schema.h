@@ -633,6 +633,7 @@ struct Schema : NIceDb::Schema {
         struct FSSettings : Column<14, NScheme::NTypeIds::String> {};
         struct TableDescription : Column<7, NScheme::NTypeIds::String> {};
         struct ChangefeedUnderlyingTopics : Column<13, NScheme::NTypeIds::String> {};
+        struct CreateTableQuery : Column<15, NScheme::NTypeIds::Utf8> {};
         struct NumberOfRetries : Column<8, NScheme::NTypeIds::Uint32> {};
         struct ScanSettings : Column<9, NScheme::NTypeIds::String> {};
         struct NeedToBill : Column<10, NScheme::NTypeIds::Bool> {};
@@ -657,7 +658,8 @@ struct Schema : NIceDb::Schema {
             EnableChecksums,
             EnablePermissions,
             ChangefeedUnderlyingTopics,
-            FSSettings
+            FSSettings,
+            CreateTableQuery
         >;
     };
 
@@ -671,6 +673,7 @@ struct Schema : NIceDb::Schema {
         struct FSSettings : Column<15, NScheme::NTypeIds::String> {};
         struct TableDescription : Column<8, NScheme::NTypeIds::String> {};
         struct ChangefeedUnderlyingTopics : Column<14, NScheme::NTypeIds::String> {};
+        struct CreateTableQuery : Column<16, NScheme::NTypeIds::Utf8> {};
         struct NumberOfRetries : Column<9, NScheme::NTypeIds::Uint32> {};
         struct ScanSettings : Column<10, NScheme::NTypeIds::String> {};
         struct NeedToBill : Column<11, NScheme::NTypeIds::Bool> {};
@@ -696,7 +699,8 @@ struct Schema : NIceDb::Schema {
             EnableChecksums,
             EnablePermissions,
             ChangefeedUnderlyingTopics,
-            FSSettings
+            FSSettings,
+            CreateTableQuery
         >;
     };
 

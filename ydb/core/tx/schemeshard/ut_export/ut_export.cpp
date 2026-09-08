@@ -1650,6 +1650,60 @@ partitioning_settings {
         UNIT_ASSERT_STRING_CONTAINS(ddl, "CREATE TABLE");
     }
 
+    Y_UNIT_TEST(ShouldPutGeneratedCreateTableQueryInBackupTask) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnableGeneratedStored(true);
+        Runtime().GetAppData().FeatureFlags.SetEnableGeneratedVirtual(true);
+
+        ui64 txId = 100;
+        TestCreateTable(Runtime(), ++txId, "/MyRoot", R"(
+            Name: "Table"
+            Columns { Name: "key" Type: "Uint32" }
+            Columns { Name: "a" Type: "Int32" }
+            Columns {
+              Name: "generated"
+              Type: "Int32"
+              DefaultFromExpression {
+                ExprText: "a + 1"
+                Stored: true
+                DependencyColumnNames: ["a"]
+              }
+            }
+            KeyColumnNames: ["key"]
+        )");
+        Env().TestWaitNotification(Runtime(), txId);
+
+        TBlockEvents<TEvDataShard::TEvProposeTransaction> block(Runtime(), [](const auto& ev) {
+            NKikimrTxDataShard::TFlatSchemeTransaction schemeTx;
+            UNIT_ASSERT(schemeTx.ParseFromString(ev->Get()->GetTxBody()));
+            return schemeTx.HasBackup();
+        });
+
+        TestExport(Runtime(), ++txId, "/MyRoot", Sprintf(R"(
+            ExportToS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_path: "/MyRoot/Table"
+                destination_prefix: ""
+              }
+            }
+        )", S3Port()));
+
+        Runtime().WaitFor("generated backup task", [&] { return block.size() == 1; });
+
+        NKikimrTxDataShard::TFlatSchemeTransaction schemeTx;
+        UNIT_ASSERT(schemeTx.ParseFromString(block.front()->Get()->GetTxBody()));
+        const auto& backup = schemeTx.GetBackup();
+        UNIT_ASSERT(backup.HasCreateTableQuery());
+        UNIT_ASSERT_STRING_CONTAINS(
+            backup.GetCreateTableQuery(),
+            "GENERATED ALWAYS AS");
+
+        block.Stop().Unblock();
+        Env().TestWaitNotification(Runtime(), txId);
+    }
+
     Y_UNIT_TEST(ShouldRejectGeneratedExportOverStaleSchemePb) {
         Env();
         Runtime().GetAppData().FeatureFlags.SetEnableGeneratedStored(true);

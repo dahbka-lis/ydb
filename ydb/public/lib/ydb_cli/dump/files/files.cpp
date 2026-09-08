@@ -13,6 +13,7 @@ enum EFilesType {
     INCOMPLETE_DATA,
     INCOMPLETE,
     EMPTY,
+    CREATE_TABLE,
     CREATE_VIEW,
     DATABASE,
     CREATE_USER,
@@ -36,6 +37,7 @@ static constexpr TFileInfo FILES_INFO[] = {
     {"incomplete.csv", "incomplete"},
     {"incomplete", "incomplete"},
     {"empty_dir", "empty_dir"},
+    {"create_table.sql", "table"},
     {"create_view.sql", "view"},
     {"database.pb", "database description"},
     {"create_user.sql", "users"},
@@ -86,6 +88,10 @@ const TFileInfo& Incomplete() {
 
 const TFileInfo& Empty() {
     return FILES_INFO[EMPTY];
+}
+
+const TFileInfo& CreateTable() {
+    return FILES_INFO[CREATE_TABLE];
 }
 
 const TFileInfo& CreateView() {

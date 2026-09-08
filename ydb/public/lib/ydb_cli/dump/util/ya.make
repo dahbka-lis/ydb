@@ -2,6 +2,7 @@ LIBRARY()
 
 SRCS(
     query_utils.cpp
+    table_utils.cpp
     util.cpp
     view_utils.cpp
     replication_utils.cpp

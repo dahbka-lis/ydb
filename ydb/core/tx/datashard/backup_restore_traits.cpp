@@ -5,6 +5,7 @@
 #include <ydb/core/protos/fs_settings.pb.h>
 #include <ydb/core/protos/s3_settings.pb.h>
 #include <ydb/library/yverify_stream/yverify_stream.h>
+#include <ydb/public/lib/ydb_cli/dump/files/files.h>
 
 #include <util/generic/hash.h>
 #include <util/string/cast.h>
@@ -151,6 +152,10 @@ TString ChangefeedKeySuffix(bool encryptedBackup) {
 
 TString SchemeKeySuffix(bool encryptedBackup) {
     return AddEncryptedSuffix("scheme.pb", encryptedBackup);
+}
+
+TString CreateTableQueryKeySuffix(bool encryptedBackup) {
+    return AddEncryptedSuffix(NYdb::NDump::NFiles::CreateTable().FileName, encryptedBackup);
 }
 
 TString MetadataKeySuffix(bool encryptedBackup) {

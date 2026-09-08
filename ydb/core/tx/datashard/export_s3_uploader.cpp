@@ -1168,12 +1168,12 @@ IActor* TS3Export::CreateUploader(const TActorId& dataShard, ui64 txId) const {
     TMaybe<TString> createTableQuery;
     TString schemeError;
     if (Task.GetShardNum() == 0) {
-        scheme = GenYdbScheme(Columns, Task.GetTable());
-        if (ShouldGenSchemeAsCreateQuery(Task.GetTable())) {
+        if (Task.HasCreateTableQuery()) {
             schemeRepresentation = ESchemeRepresentation::CreateTableQuery;
-            createTableQuery = GenCreateTableQuery(Task, schemeError);
+            createTableQuery = Task.GetCreateTableQuery();
         } else {
             schemeRepresentation = ESchemeRepresentation::Proto;
+            scheme = GenYdbScheme(Columns, Task.GetTable());
         }
     }
 

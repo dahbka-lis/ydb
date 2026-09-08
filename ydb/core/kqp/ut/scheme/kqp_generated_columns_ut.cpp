@@ -2375,4 +2375,60 @@ Y_UNIT_TEST_SUITE(GeneratedStoredStreamLookup) {
 //     }
 // }
 
+Y_UNIT_TEST_SUITE(GeneratedColumnsBackupCollections) {
+    static TKikimrRunner MakeRunner() {
+        NKikimrConfig::TAppConfig config;
+        config.MutableFeatureFlags()->SetEnableBackupService(true);
+        config.MutableFeatureFlags()->SetEnableGeneratedStored(true);
+        config.MutableFeatureFlags()->SetEnableGeneratedVirtual(true);
+        return TKikimrRunner(TKikimrSettings(config).SetEnableBackupService(true));
+    }
+
+    Y_UNIT_TEST(BackupRestoreStored) {
+        auto kikimr = MakeRunner();
+        auto session = kikimr.GetTableClient().CreateSession().GetValueSync().GetSession();
+        auto queryClient = kikimr.GetQueryClient();
+
+        auto execScheme = [&](const TString& query) {
+            auto result = session.ExecuteSchemeQuery(query).ExtractValueSync();
+            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+        };
+        auto exec = [&](const TString& query) {
+            auto result = queryClient.ExecuteQuery(query, TTxControl::NoTx()).ExtractValueSync();
+            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+        };
+
+        execScheme(R"(
+            CREATE TABLE `/Root/GenTable` (
+                key Uint32 NOT NULL,
+                a Int32,
+                sum Int32 GENERATED ALWAYS AS (COALESCE(a, 0) * 2) STORED,
+                PRIMARY KEY (key)
+            );
+        )");
+        exec("UPSERT INTO `/Root/GenTable` (key, a) VALUES (1, 10), (2, 20);");
+        execScheme(R"(
+            CREATE BACKUP COLLECTION `gen_backup` ( TABLE `/Root/GenTable` )
+            WITH ( STORAGE = 'cluster' );
+        )");
+        exec("BACKUP `gen_backup`;");
+        execScheme("DROP TABLE `/Root/GenTable`;");
+        exec("RESTORE `gen_backup`;");
+
+        auto data = queryClient.ExecuteQuery(
+            "SELECT key, a, sum FROM `/Root/GenTable` ORDER BY key;",
+            TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT_C(data.IsSuccess(), data.GetIssues().ToString());
+        CompareYson(R"([[1u;[10];[20]];[2u;[20];[40]]])",
+            FormatResultSetYson(data.GetResultSet(0)));
+
+        exec("UPSERT INTO `/Root/GenTable` (key, a) VALUES (3, 30);");
+        auto recomputed = queryClient.ExecuteQuery(
+            "SELECT sum FROM `/Root/GenTable` WHERE key = 3;",
+            TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT_C(recomputed.IsSuccess(), recomputed.GetIssues().ToString());
+        CompareYson(R"([[[60]]])", FormatResultSetYson(recomputed.GetResultSet(0)));
+    }
+}
+
 }   // namespace NKikimr::NKqp

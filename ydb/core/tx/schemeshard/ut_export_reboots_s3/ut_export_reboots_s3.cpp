@@ -1,6 +1,7 @@
 #include <ydb/core/tx/schemeshard/ut_helpers/export_reboots_common.h>
 #include <ydb/core/tx/schemeshard/ut_helpers/helpers.h>
 #include <ydb/core/tx/schemeshard/ut_helpers/test_with_reboots.h>
+#include <ydb/core/testlib/actors/block_events.h>
 #include <ydb/core/wrappers/ut_helpers/s3_mock.h>
 #include <ydb/library/aws_init/aws.h>
 
@@ -210,6 +211,68 @@ Y_UNIT_TEST_SUITE(TExportToS3WithRebootsTests) {
                 KeyColumnNames: ["key"]
             )",
         }, {{"/MyRoot/Table", ""}});
+    }
+
+    Y_UNIT_TEST_WITH_REBOOTS_BUCKETS(ShouldPersistGeneratedCreateTableQueryAcrossSchemeShardRestart, 1, 0, false) {
+        TExportEnv<false> env({{"/MyRoot/Table", ""}});
+
+        t.Run([&](TTestActorRuntime& runtime, bool& activeZone) {
+            TInactiveZone inactive(activeZone);
+            env.SetupRuntime(runtime);
+            runtime.GetAppData().FeatureFlags.SetEnableGeneratedStored(true);
+            runtime.GetAppData().FeatureFlags.SetEnableGeneratedVirtual(true);
+
+            CreateSchemeObjects(t, runtime, {
+                R"(
+                    Name: "Table"
+                    Columns { Name: "key" Type: "Uint32" }
+                    Columns { Name: "a" Type: "Int32" }
+                    Columns {
+                      Name: "generated"
+                      Type: "Int32"
+                      DefaultFromExpression {
+                        ExprText: "a + 1"
+                        Stored: true
+                        DependencyColumnNames: ["a"]
+                      }
+                    }
+                    KeyColumnNames: ["key"]
+                )",
+            });
+
+            TBlockEvents<TEvDataShard::TEvProposeTransaction> block(runtime, [](const auto& ev) {
+                NKikimrTxDataShard::TFlatSchemeTransaction schemeTx;
+                UNIT_ASSERT(schemeTx.ParseFromString(ev->Get()->GetTxBody()));
+                return schemeTx.HasBackup();
+            });
+
+            TestExport(runtime, ++t.TxId, "/MyRoot", env.Request);
+            const ui64 exportId = t.TxId;
+            runtime.WaitFor("first generated backup task", [&] { return block.size() == 1; });
+
+            auto getCreateTableQuery = [](const auto& ev) {
+                NKikimrTxDataShard::TFlatSchemeTransaction schemeTx;
+                UNIT_ASSERT(schemeTx.ParseFromString(ev->Get()->GetTxBody()));
+                const auto& backup = schemeTx.GetBackup();
+                UNIT_ASSERT(backup.HasCreateTableQuery());
+                return backup.GetCreateTableQuery();
+            };
+
+            const TString firstQuery = getCreateTableQuery(block.front());
+            UNIT_ASSERT_STRING_CONTAINS(firstQuery, "GENERATED ALWAYS AS");
+
+            RebootTablet(runtime, TTestTxConfig::SchemeShard, runtime.AllocateEdgeActor());
+            runtime.WaitFor("resent generated backup task", [&] { return block.size() == 2; });
+
+            const TString resentQuery = getCreateTableQuery(block.back());
+            UNIT_ASSERT_VALUES_EQUAL(firstQuery, resentQuery);
+
+            block.pop_front();
+            block.Stop().Unblock();
+            t.TestEnv->TestWaitNotification(runtime, exportId);
+            TestGetExport(runtime, exportId, "/MyRoot");
+            UNIT_ASSERT(env.HasFile("/create_table.sql"));
+        });
     }
 
     Y_UNIT_TEST_WITH_REBOOTS_BUCKETS_TWIN(ShouldSucceedOnMultiShardTable, 2, 1, false, IsFs) {

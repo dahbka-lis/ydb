@@ -292,6 +292,7 @@ PEERDIR(
     yql/essentials/core/minsketch
     yql/essentials/parser/pg_wrapper/interface
     ydb/public/api/protos
+    ydb/public/lib/ydb_cli/dump/files
     yql/essentials/parser/pg_wrapper/interface
     ydb/services/lib/sharding
     yql/essentials/types/uuid

@@ -979,6 +979,95 @@ void TestViewOutputIsPreserved(
     CompareResults(GetTableContent(session, view), originalContent);
 }
 
+TString FetchShowCreateTableDdl(NQuery::TSession& session, const char* table);
+
+void TestTableWithGeneratedColumnIsPreserved(
+    const char* table, TSession& tableSession, NQuery::TSession& session,
+    TBackupFunction&& backup, TRestoreFunction&& restore
+) {
+    constexpr const char* AttributeKey = "backup_test_attribute";
+    constexpr const char* AttributeValue = "preserved";
+
+    ExecuteQuery(session, Sprintf(R"(
+                CREATE TABLE `%s` (
+                    key Uint32 NOT NULL,
+                    a Int32,
+                    sum Int32 GENERATED ALWAYS AS (COALESCE(a, 0) * 3) STORED,
+                    next Int32 GENERATED ALWAYS AS (COALESCE(a, 0) + 1) VIRTUAL,
+                    PRIMARY KEY (key)
+                );
+            )", table
+        ), true
+    );
+    {
+        const auto result = tableSession.AlterTable(table, TAlterTableSettings()
+            .BeginAlterAttributes()
+                .Add(AttributeKey, AttributeValue)
+            .EndAlterAttributes()
+        ).ExtractValueSync();
+        UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+    }
+
+    const auto assertUserAttribute = [&] {
+        const auto result = tableSession.DescribeTable(table).ExtractValueSync();
+        UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+
+        const auto& attributes = result.GetTableDescription().GetAttributes();
+        const auto it = attributes.find(AttributeKey);
+        UNIT_ASSERT_C(it != attributes.end(), "table user attribute is missing");
+        UNIT_ASSERT_VALUES_EQUAL(it->second, AttributeValue);
+    };
+    assertUserAttribute();
+
+    ExecuteQuery(session, Sprintf(R"(
+                UPSERT INTO `%s` (key, a) VALUES (1, 7);
+            )", table
+        )
+    );
+    const auto getPhysicalContent = [&] {
+        return ExecuteQuery(session, Sprintf(R"(
+                    SELECT key, a, sum FROM `%s` ORDER BY key;
+                )", table
+            )
+        );
+    };
+    const auto originalContent = getPhysicalContent();
+    const TString ddlBefore = FetchShowCreateTableDdl(session, table);
+    UNIT_ASSERT_C(ddlBefore.Contains("GENERATED ALWAYS AS (COALESCE(a, 0) * 3) STORED"), ddlBefore);
+    UNIT_ASSERT_C(ddlBefore.Contains("GENERATED ALWAYS AS (COALESCE(a, 0) + 1) VIRTUAL"), ddlBefore);
+
+    backup();
+
+    ExecuteQuery(session, Sprintf(R"(
+                DROP TABLE `%s`;
+            )", table
+        ), true
+    );
+
+    restore();
+    CompareResults(getPhysicalContent(), originalContent);
+    UNIT_ASSERT_STRINGS_EQUAL(FetchShowCreateTableDdl(session, table), ddlBefore);
+    assertUserAttribute();
+
+    ExecuteQuery(session, Sprintf(R"(
+                UPSERT INTO `%s` (key, a) VALUES (2, 10);
+            )", table
+        )
+    );
+    const auto result = ExecuteQuery(session, Sprintf(R"(
+                SELECT sum FROM `%s` WHERE key = 2;
+            )", table
+        )
+    );
+    UNIT_ASSERT_VALUES_EQUAL(result.GetResultSets().size(), 1u);
+    TResultSetParser parser(result.GetResultSet(0));
+    UNIT_ASSERT(parser.TryNextRow());
+    const auto sum = parser.ColumnParser("sum").GetOptionalInt32();
+    UNIT_ASSERT_C(sum.has_value(), "generated sum is NULL after restore");
+    UNIT_ASSERT_VALUES_EQUAL(*sum, 30);
+    UNIT_ASSERT(!parser.TryNextRow());
+}
+
 void TestViewQueryTextIsPreserved(
     const char* view, TViewClient& viewClient, NQuery::TSession& session, TBackupFunction&& backup, TRestoreFunction&& restore
 ) {
@@ -4182,6 +4271,21 @@ Y_UNIT_TEST_SUITE(BackupRestoreS3) {
             table,
             minPartitions,
             testEnv.GetTableSession(),
+            CreateBackupLambda(testEnv.GetDriver(), testEnv.GetS3Port()),
+            CreateRestoreLambda(testEnv.GetDriver(), testEnv.GetS3Port(), { "table" })
+        );
+    }
+
+    Y_UNIT_TEST(GeneratedColumnIsPreservedThroughS3BackupRestore) {
+        TS3TestEnv testEnv;
+        testEnv.GetServer().GetRuntime()->GetAppData().FeatureFlags.SetEnableGeneratedStored(true);
+        testEnv.GetServer().GetRuntime()->GetAppData().FeatureFlags.SetEnableGeneratedVirtual(true);
+        constexpr const char* table = "/Root/table";
+
+        TestTableWithGeneratedColumnIsPreserved(
+            table,
+            testEnv.GetTableSession(),
+            testEnv.GetQuerySession(),
             CreateBackupLambda(testEnv.GetDriver(), testEnv.GetS3Port()),
             CreateRestoreLambda(testEnv.GetDriver(), testEnv.GetS3Port(), { "table" })
         );

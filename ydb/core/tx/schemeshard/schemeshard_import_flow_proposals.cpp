@@ -6,6 +6,7 @@
 
 #include <ydb/core/base/auth.h>
 #include <ydb/core/base/path.h>
+#include <ydb/core/base/table_index.h>
 #include <ydb/core/persqueue/public/schema/schema_propose.h>
 #include <ydb/core/protos/s3_settings.pb.h>
 #include <ydb/core/protos/fs_settings.pb.h>
@@ -17,6 +18,251 @@
 
 namespace NKikimr {
 namespace NSchemeShard {
+
+namespace {
+
+enum class EPreparedIndexKind {
+    Global,
+    GlobalAsync,
+    GlobalUnique,
+    Local,
+    Unsupported,
+};
+
+EPreparedIndexKind ClassifyPreparedIndex(const NKikimrSchemeOp::TIndexCreationConfig& index) {
+    switch (NTableIndex::GetIndexType(index)) {
+        case NKikimrSchemeOp::EIndexTypeGlobal:
+            return EPreparedIndexKind::Global;
+        case NKikimrSchemeOp::EIndexTypeGlobalAsync:
+            return EPreparedIndexKind::GlobalAsync;
+        case NKikimrSchemeOp::EIndexTypeGlobalUnique:
+            return EPreparedIndexKind::GlobalUnique;
+        case NKikimrSchemeOp::EIndexTypeLocalBloomFilter:
+        case NKikimrSchemeOp::EIndexTypeLocalBloomNgramFilter:
+        case NKikimrSchemeOp::EIndexTypeLocalMinMax:
+        case NKikimrSchemeOp::EIndexTypeLocalCountMinSketch:
+            return EPreparedIndexKind::Local;
+        default:
+            return EPreparedIndexKind::Unsupported;
+    }
+}
+
+bool IsBuildablePreparedIndex(EPreparedIndexKind kind) {
+    return IsIn({
+        EPreparedIndexKind::Global,
+        EPreparedIndexKind::GlobalAsync,
+        EPreparedIndexKind::GlobalUnique,
+    }, kind);
+}
+
+const google::protobuf::RepeatedPtrField<NKikimrSchemeOp::TIndexCreationConfig>* GetPreparedIndexes(
+    const TImportInfo::TItem& item,
+    TString& error)
+{
+    if (!item.PreparedCreationQuery ||
+        item.PreparedCreationQuery->GetOperationType() != NKikimrSchemeOp::ESchemeOpCreateIndexedTable) {
+        return nullptr;
+    }
+
+    if (!item.PreparedCreationQuery->HasCreateIndexedTable()) {
+        error = "Prepared CREATE INDEXED TABLE operation has no creation config";
+        return nullptr;
+    }
+
+    return &item.PreparedCreationQuery->GetCreateIndexedTable().GetIndexDescription();
+}
+
+bool FillPreparedIndexDescription(
+    Ydb::Table::TableIndex& index,
+    const NKikimrSchemeOp::TIndexCreationConfig& preparedIndex,
+    TString& error)
+{
+    if (preparedIndex.GetName().empty()) {
+        error = "Prepared index has no name";
+        return false;
+    }
+
+    index.set_name(preparedIndex.GetName());
+    index.mutable_index_columns()->CopyFrom(preparedIndex.GetKeyColumnNames());
+    index.mutable_data_columns()->CopyFrom(preparedIndex.GetDataColumnNames());
+
+    switch (ClassifyPreparedIndex(preparedIndex)) {
+        case EPreparedIndexKind::Global:
+            index.mutable_global_index();
+            return true;
+        case EPreparedIndexKind::GlobalAsync:
+            index.mutable_global_async_index();
+            return true;
+        case EPreparedIndexKind::GlobalUnique:
+            index.mutable_global_unique_index();
+            return true;
+        default:
+            error = TStringBuilder()
+                << "Unsupported prepared index type: "
+                << NKikimrSchemeOp::EIndexType_Name(NTableIndex::GetIndexType(preparedIndex));
+            return false;
+    }
+}
+
+} // anonymous namespace
+
+bool IsLocalPreparedIndex(const NKikimrSchemeOp::TIndexCreationConfig& index) {
+    return ClassifyPreparedIndex(index) == EPreparedIndexKind::Local;
+}
+
+bool ValidatePreparedIndexes(
+    const TImportInfo& importInfo,
+    ui32 itemIdx,
+    TString& error)
+{
+    error.clear();
+    Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
+    const auto& item = importInfo.Items.at(itemIdx);
+    if (!item.PreparedCreationQuery) {
+        return true;
+    }
+
+    const google::protobuf::RepeatedPtrField<NKikimrSchemeOp::TIndexCreationConfig>* indexes = nullptr;
+    switch (item.PreparedCreationQuery->GetOperationType()) {
+        case NKikimrSchemeOp::ESchemeOpCreateTable:
+            break;
+        case NKikimrSchemeOp::ESchemeOpCreateIndexedTable:
+            indexes = GetPreparedIndexes(item, error);
+            if (!indexes) {
+                return false;
+            }
+            break;
+        default:
+            return true;
+    }
+
+    const bool buildIndexes = NeedToBuildIndexes(importInfo, itemIdx);
+
+    THashSet<TString> expectedPaths;
+    TVector<TString> expectedPathsInOrder;
+    if (indexes) {
+        for (const auto& index : *indexes) {
+            const auto kind = ClassifyPreparedIndex(index);
+            if (kind == EPreparedIndexKind::Local) {
+                continue;
+            }
+            if (!IsBuildablePreparedIndex(kind)) {
+                error = TStringBuilder()
+                    << "Unsupported prepared index type: "
+                    << NKikimrSchemeOp::EIndexType_Name(NTableIndex::GetIndexType(index));
+                return false;
+            }
+            if (index.GetName().empty()) {
+                error = "Prepared index has no name";
+                return false;
+            }
+
+            if (buildIndexes) {
+                continue;
+            }
+
+            const TVector<TString> indexColumns(
+                index.GetKeyColumnNames().begin(), index.GetKeyColumnNames().end());
+            for (const auto implTable :
+                 NTableIndex::GetImplTables(NTableIndex::GetIndexType(index), indexColumns)) {
+                TString expectedPath = TStringBuilder()
+                    << item.DstPathName << "/" << index.GetName() << "/" << implTable;
+                if (!expectedPaths.insert(expectedPath).second) {
+                    error = TStringBuilder()
+                        << "Duplicate expected materialized index child path: " << expectedPath;
+                    return false;
+                }
+                expectedPathsInOrder.push_back(std::move(expectedPath));
+            }
+        }
+    }
+
+    if (buildIndexes) {
+        return true;
+    }
+
+    // AUTO with no usable materialized children is BUILD. A nonempty ChildItems set,
+    // however, has already been persisted by the scheme getter. It cannot be discarded
+    // here without racing or duplicating implementation-table restores, so validate it
+    // exactly like explicit IMPORT and fail before creating the destination on mismatch.
+
+    THashSet<TString> materializedPaths;
+    TVector<TString> materializedPathsInOrder;
+    materializedPaths.reserve(item.ChildItems.size());
+    materializedPathsInOrder.reserve(item.ChildItems.size());
+    for (const ui32 childIdx : item.ChildItems) {
+        if (childIdx >= importInfo.Items.size()) {
+            error = TStringBuilder()
+                << "Materialized index child position is out of range: " << childIdx;
+            return false;
+        }
+
+        const auto& materializedPath = importInfo.Items.at(childIdx).DstPathName;
+        if (!materializedPaths.insert(materializedPath).second) {
+            error = TStringBuilder()
+                << "Duplicate materialized index child path: " << materializedPath;
+            return false;
+        }
+        materializedPathsInOrder.push_back(materializedPath);
+    }
+
+    for (const auto& materializedPath : materializedPathsInOrder) {
+        if (!expectedPaths.contains(materializedPath)) {
+            error = TStringBuilder()
+                << "Unexpected materialized index child table: "
+                << materializedPath;
+            return false;
+        }
+    }
+
+    for (const auto& expectedPath : expectedPathsInOrder) {
+        if (!materializedPaths.contains(expectedPath)) {
+            error = TStringBuilder()
+                << "Missing materialized index child table: " << expectedPath;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool PrepareNextBuildableIndex(
+    const TImportInfo& importInfo,
+    ui32 itemIdx,
+    TImportInfo::TItem& item,
+    TString& error)
+{
+    error.clear();
+    if (!NeedToBuildIndexes(importInfo, itemIdx)) {
+        return false;
+    }
+
+    if (item.Table) {
+        while (item.NextIndexIdx < item.Table->indexes_size() &&
+               NTableIndex::IsLocalTableIndex(item.Table->indexes(item.NextIndexIdx).type_case())) {
+            ++item.NextIndexIdx;
+        }
+
+        return item.NextIndexIdx < item.Table->indexes_size();
+    }
+
+    const auto* indexes = GetPreparedIndexes(item, error);
+    if (!indexes) {
+        return false;
+    }
+
+    while (item.NextIndexIdx < indexes->size() &&
+           IsLocalPreparedIndex(indexes->Get(item.NextIndexIdx))) {
+        ++item.NextIndexIdx;
+    }
+
+    if (item.NextIndexIdx >= indexes->size()) {
+        return false;
+    }
+
+    Ydb::Table::TableIndex unused;
+    return FillPreparedIndexDescription(unused, indexes->Get(item.NextIndexIdx), error);
+}
 
 static bool FillDefaultValues(
     const NKikimr::NSchemeShard::TImportInfo::TItem& item,
@@ -220,7 +466,6 @@ THolder<TEvSchemeShard::TEvModifySchemeTransaction> RestoreTableDataPropose(
 ) {
     Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
     const auto& item = importInfo.Items.at(itemIdx);
-    Y_ABORT_UNLESS(item.Table);
 
     auto propose = MakeModifySchemeTransaction(ss, txId, importInfo);
     auto& record = propose->Record;
@@ -236,7 +481,20 @@ THolder<TEvSchemeShard::TEvModifySchemeTransaction> RestoreTableDataPropose(
 
     auto& task = *modifyScheme.MutableRestore();
     task.SetTableName(dstPath.LeafName());
-    *task.MutableTableDescription() = RebuildTableDescription(GetTableDescription(ss, item.DstPathId), *item.Table);
+    const auto destination = GetTableDescription(ss, item.DstPathId);
+    if (item.Table) {
+        *task.MutableTableDescription() = RebuildTableDescription(destination, *item.Table);
+    } else {
+        auto tableDescription = destination;
+        tableDescription.ClearColumns();
+        for (const auto& column : destination.GetColumns()) {
+            if (column.HasDefaultFromExpression() && !column.GetDefaultFromExpression().GetStored()) {
+                continue;
+            }
+            tableDescription.AddColumns()->CopyFrom(column);
+        }
+        *task.MutableTableDescription() = std::move(tableDescription);
+    }
 
     switch (importInfo.Kind) {
     case TImportInfo::EKind::S3:
@@ -312,11 +570,11 @@ THolder<TEvIndexBuilder::TEvCreateRequest> BuildIndexPropose(
     TTxId txId,
     const TImportInfo& importInfo,
     ui32 itemIdx,
-    const TString& uid
+    const TString& uid,
+    TString& error
 ) {
     Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
     const auto& item = importInfo.Items.at(itemIdx);
-    Y_ABORT_UNLESS(item.Table);
 
     NKikimrIndexBuilder::TIndexBuildSettings settings;
 
@@ -326,11 +584,32 @@ THolder<TEvIndexBuilder::TEvCreateRequest> BuildIndexPropose(
         settings.set_max_shards_in_flight(ss->MaxRestoreBuildIndexShardsInFlight);
     }
 
-    Y_ABORT_UNLESS(item.NextIndexIdx < item.Table->indexes_size());
-    settings.mutable_index()->CopyFrom(item.Table->indexes(item.NextIndexIdx));
+    if (item.Table) {
+        if (item.NextIndexIdx >= item.Table->indexes_size()) {
+            error = "Index position is out of range for the imported table schema";
+            return nullptr;
+        }
 
-    if (settings.mutable_index()->type_case() == Ydb::Table::TableIndex::TypeCase::TYPE_NOT_SET) {
-        settings.mutable_index()->mutable_global_index();
+        settings.mutable_index()->CopyFrom(item.Table->indexes(item.NextIndexIdx));
+        if (settings.mutable_index()->type_case() == Ydb::Table::TableIndex::TypeCase::TYPE_NOT_SET) {
+            settings.mutable_index()->mutable_global_index();
+        }
+    } else {
+        const auto* indexes = GetPreparedIndexes(item, error);
+        if (!indexes) {
+            if (error.empty()) {
+                error = "Prepared CREATE INDEXED TABLE operation is required to build indexes";
+            }
+            return nullptr;
+        }
+        if (item.NextIndexIdx >= indexes->size()) {
+            error = "Index position is out of range for the prepared table schema";
+            return nullptr;
+        }
+        if (!FillPreparedIndexDescription(
+                *settings.mutable_index(), indexes->Get(item.NextIndexIdx), error)) {
+            return nullptr;
+        }
     }
 
     const TPath domainPath = TPath::Init(importInfo.DomainPathId, ss);

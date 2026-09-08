@@ -45,6 +45,14 @@ const std::optional<std::vector<TIndexMetadata>>& TMetadata::GetIndexes() const 
     return Indexes;
 }
 
+void TMetadata::SetTableUserAttributes(std::vector<TTableUserAttribute> attributes) {
+    TableUserAttributes = std::move(attributes);
+}
+
+const std::optional<std::vector<TTableUserAttribute>>& TMetadata::GetTableUserAttributes() const {
+    return TableUserAttributes;
+}
+
 void TMetadata::SetEnablePermissions(bool enablePermissions) {
     EnablePermissions = enablePermissions;
 }
@@ -99,6 +107,17 @@ TString TMetadata::Serialize() const {
     }
     m["indexes"] = indexes;
 
+    if (TableUserAttributes) {
+        NJson::TJsonArray attributes;
+        for (const auto& attribute : *TableUserAttributes) {
+            NJson::TJsonMap attributeMap;
+            attributeMap["key"] = attribute.Key;
+            attributeMap["value"] = attribute.Value;
+            attributes.AppendValue(std::move(attributeMap));
+        }
+        m["table_user_attributes"] = std::move(attributes);
+    }
+
     return NJson::WriteJson(&m, false);
 }
 
@@ -136,6 +155,17 @@ TMetadata TMetadata::Deserialize(const TString& metadata) {
             result.AddIndex({
                 .ExportPrefix = index["export_prefix"].GetString(),
                 .ImplTablePrefix = index["impl_table_prefix"].GetString(),
+            });
+        }
+    }
+
+    if (json.Has("table_user_attributes")) {
+        result.TableUserAttributes.emplace();
+        const NJson::TJsonValue& attributes = json["table_user_attributes"];
+        for (const NJson::TJsonValue& attribute : attributes.GetArray()) {
+            result.TableUserAttributes->push_back({
+                .Key = attribute["key"].GetString(),
+                .Value = attribute["value"].GetString(),
             });
         }
     }

@@ -32,4 +32,29 @@ Y_UNIT_TEST_SUITE(PathsNormalizationTest) {
     }
 }
 
+Y_UNIT_TEST_SUITE(MetadataTest) {
+    Y_UNIT_TEST(TableUserAttributesRoundTrip) {
+        TMetadata metadata;
+        metadata.SetVersion(1);
+        metadata.SetTableUserAttributes({
+            {.Key = "backup_test_attribute", .Value = "preserved"},
+            {.Key = "empty_attribute", .Value = ""},
+        });
+
+        const auto restored = TMetadata::Deserialize(metadata.Serialize());
+        const auto& attributes = restored.GetTableUserAttributes();
+        UNIT_ASSERT(attributes);
+        UNIT_ASSERT_VALUES_EQUAL(attributes->size(), 2u);
+        UNIT_ASSERT_VALUES_EQUAL(attributes->at(0).Key, "backup_test_attribute");
+        UNIT_ASSERT_VALUES_EQUAL(attributes->at(0).Value, "preserved");
+        UNIT_ASSERT_VALUES_EQUAL(attributes->at(1).Key, "empty_attribute");
+        UNIT_ASSERT_VALUES_EQUAL(attributes->at(1).Value, "");
+    }
+
+    Y_UNIT_TEST(LegacyMetadataHasNoTableUserAttributes) {
+        const auto metadata = TMetadata::Deserialize(R"({"version": 0})");
+        UNIT_ASSERT(!metadata.GetTableUserAttributes());
+    }
+}
+
 } // namespace NKikimr::NBackup

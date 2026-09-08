@@ -133,6 +133,37 @@ Y_UNIT_TEST_SUITE(TBackupCollectionTests) {
         TestModificationResults(runtime, txId, {expectedResult});
     }
 
+    void PrepareGeneratedColumnsCollectionBackup(TTestBasicRuntime& runtime, TTestEnv& env, ui64& txId) {
+        PrepareDirs(runtime, env, txId);
+
+        TestCreateBackupCollection(runtime, ++txId, "/MyRoot/.backups/collections",
+            DefaultCollectionSettings());
+        env.TestWaitNotification(runtime, txId);
+
+        TestCreateTable(runtime, ++txId, "/MyRoot", R"(
+            Name: "Table1"
+            Columns { Name: "key" Type: "Uint32" }
+            Columns { Name: "a"   Type: "Int32"  }
+            Columns { Name: "b"   Type: "Int32"  }
+            Columns {
+              Name: "sum"
+              Type: "Int32"
+              DefaultFromExpression {
+                ExprText: "a + b"
+                Stored: true
+                DependencyColumnNames: ["a", "b"]
+                Context: ""
+              }
+            }
+            KeyColumnNames: ["key"]
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        TestBackupBackupCollection(runtime, ++txId, "/MyRoot",
+            R"(Name: ".backups/collections/MyCollection1")");
+        env.TestWaitNotification(runtime, txId);
+    }
+
     Y_UNIT_TEST(HiddenByFeatureFlag) {
         TTestBasicRuntime runtime;
         TTestEnv env(runtime, TTestEnvOptions());
@@ -2388,6 +2419,56 @@ Y_UNIT_TEST_SUITE(TBackupCollectionTests) {
         
         // Verify ChildrenExist flag is set (index exists as child, even if not in Children list)
         UNIT_ASSERT(tableDesc.GetPathDescription().GetSelf().GetChildrenExist());
+    }
+
+    Y_UNIT_TEST(BackupCollectionWithGeneratedColumns) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime, TTestEnvOptions().EnableBackupService(true));
+        ui64 txId = 100;
+
+        runtime.GetAppData().FeatureFlags.SetEnableGeneratedStored(true);
+        runtime.GetAppData().FeatureFlags.SetEnableGeneratedVirtual(true);
+
+        PrepareGeneratedColumnsCollectionBackup(runtime, env, txId);
+
+        auto collectionDescr = DescribePath(runtime, "/MyRoot/.backups/collections/MyCollection1");
+        UNIT_ASSERT(collectionDescr.GetPathDescription().ChildrenSize() >= 1);
+        const TString fullDir = collectionDescr.GetPathDescription().GetChildren(0).GetName();
+
+        auto backupTable = DescribePath(runtime,
+            "/MyRoot/.backups/collections/MyCollection1/" + fullDir + "/Table1", true, true);
+        const auto& tableDescr = backupTable.GetPathDescription().GetTable();
+
+        bool found = false;
+        for (const auto& col : tableDescr.GetColumns()) {
+            if (col.GetName() == "sum") {
+                found = true;
+                UNIT_ASSERT(col.HasDefaultFromExpression());
+                UNIT_ASSERT_VALUES_EQUAL(col.GetDefaultFromExpression().GetExprText(), "a + b");
+                UNIT_ASSERT(col.GetDefaultFromExpression().GetStored());
+                UNIT_ASSERT_VALUES_EQUAL(col.GetDefaultFromExpression().DependencyColumnNamesSize(), 2u);
+            }
+        }
+        UNIT_ASSERT(found);
+    }
+
+    Y_UNIT_TEST(RestoreWithGeneratedColumnsRejectedWhenFlagOff) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime, TTestEnvOptions().EnableBackupService(true));
+        ui64 txId = 100;
+
+        runtime.GetAppData().FeatureFlags.SetEnableGeneratedStored(true);
+        PrepareGeneratedColumnsCollectionBackup(runtime, env, txId);
+
+        TestDropTable(runtime, ++txId, "/MyRoot", "Table1");
+        env.TestWaitNotification(runtime, txId);
+
+        runtime.GetAppData().FeatureFlags.SetEnableGeneratedStored(false);
+
+        TestRestoreBackupCollection(runtime, ++txId, "/MyRoot",
+            R"(Name: ".backups/collections/MyCollection1")",
+            {NKikimrScheme::StatusSchemeError});
+        env.TestWaitNotification(runtime, txId);
     }
 
     Y_UNIT_TEST(BackupWithIndexesOmit) {

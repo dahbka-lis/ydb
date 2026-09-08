@@ -401,12 +401,18 @@ Y_UNIT_TEST_SUITE(TBackupTests) {
         env.TestWaitNotification(runtime, txId);
     }
 
-    Y_UNIT_TEST(ShouldRejectBackupOfTableWithGeneratedColumn) {
+    Y_UNIT_TEST(ShouldBackupTableWithGeneratedColumn) {
         TTestBasicRuntime runtime;
         TTestEnv env(runtime);
 
         runtime.GetAppData().FeatureFlags.SetEnableGeneratedStored(true);
         runtime.GetAppData().FeatureFlags.SetEnableGeneratedVirtual(true);
+
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+
+        TS3Mock s3Mock({}, TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
 
         ui64 txId = 100;
 
@@ -429,14 +435,22 @@ Y_UNIT_TEST_SUITE(TBackupTests) {
         )");
         env.TestWaitNotification(runtime, txId);
 
-        TestBackup(runtime, ++txId, "/MyRoot", R"(
+        const auto tableDesc = DescribePath(runtime, "/MyRoot/Table", true, true);
+        TString tableSchema;
+        UNIT_ASSERT(google::protobuf::TextFormat::PrintToString(tableDesc.GetPathDescription(), &tableSchema));
+
+        TestBackup(runtime, ++txId, "/MyRoot", Sprintf(R"(
             TableName: "Table"
+            Table {
+                %s
+            }
             S3Settings {
-                Endpoint: "localhost:1"
+                Endpoint: "localhost:%d"
                 Scheme: HTTP
             }
-        )",
-            { { NKikimrScheme::StatusPreconditionFailed, "Cannot backup table with generated column 'sum'" } });
+            CreateTableQuery: "CREATE TABLE `/MyRoot/Table` (key Uint32, a Int32, b Int32, sum Int32 GENERATED ALWAYS AS (a + b) STORED, PRIMARY KEY (key));"
+        )", tableSchema.c_str(), port));
+        env.TestWaitNotification(runtime, txId);
     }
 
 } // TBackupTests

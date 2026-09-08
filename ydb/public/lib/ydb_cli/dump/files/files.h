@@ -17,6 +17,7 @@ const TFileInfo& CreateRateLimiter();
 const TFileInfo& IncompleteData();
 const TFileInfo& Incomplete();
 const TFileInfo& Empty();
+const TFileInfo& CreateTable();
 const TFileInfo& CreateView();
 const TFileInfo& Database();
 const TFileInfo& CreateUser();

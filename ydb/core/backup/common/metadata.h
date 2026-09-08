@@ -8,6 +8,9 @@
 #include <util/generic/ptr.h>
 #include <util/generic/string.h>
 
+#include <optional>
+#include <vector>
+
 namespace NKikimr::NBackup {
 
 using TVirtualTimestamp = TRowVersion;
@@ -46,6 +49,11 @@ struct TIndexMetadata {
     TString ImplTablePrefix;
 };
 
+struct TTableUserAttribute {
+    TString Key;
+    TString Value;
+};
+
 class TMetadata {
 public:
     TMetadata() = default;
@@ -63,6 +71,9 @@ public:
 
     void AddIndex(const TIndexMetadata& index);
     const std::optional<std::vector<TIndexMetadata>>& GetIndexes() const;
+
+    void SetTableUserAttributes(std::vector<TTableUserAttribute> attributes);
+    const std::optional<std::vector<TTableUserAttribute>>& GetTableUserAttributes() const;
 
     void SetEnablePermissions(bool enablePermissions = true);
     bool HasEnablePermissions() const;
@@ -88,6 +99,12 @@ private:
     // []: The export has no materialized indexes
     // [...]: The export must have all materialized indexes listed here
     std::optional<std::vector<TIndexMetadata>> Indexes;
+
+    // TableUserAttributes:
+    // Undefined (previous versions and non-query table schemes): no attributes are available here
+    // []: The query-created table has no user attributes
+    // [...]: The query-created table must be created with these user attributes
+    std::optional<std::vector<TTableUserAttribute>> TableUserAttributes;
 
     // EnablePermissions:
     // Undefined (previous versions): we don't know if we see the export with permissions or without them, so check S3 for the permissions file existence
