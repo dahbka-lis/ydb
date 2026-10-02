@@ -1,7 +1,16 @@
 #include <ydb/core/tx/schemeshard/ut_helpers/helpers.h>
+#include <ydb/core/tx/schemeshard/schemeshard_import_getters.h>
+#include <ydb/core/tx/schemeshard/schemeshard_import_scheme_query_executor.h>
+#include <ydb/core/tx/schemeshard/schemeshard_private.h>
 #include <ydb/core/backup/common/metadata.h>
 #include <ydb/core/backup/common/checksum.h>
+#include <ydb/core/kqp/common/events/query.h>
+#include <ydb/core/kqp/common/simple/services.h>
 #include <ydb/core/kqp/ut/common/kqp_ut_common.h>
+#include <ydb/core/protos/schemeshard/operations.pb.h>
+#include <ydb/core/tx/datashard/datashard.h>
+#include <ydb/core/wrappers/abstract.h>
+#include <ydb/core/wrappers/ut_helpers/s3_mock.h>
 
 #include <ydb/public/api/protos/ydb_import.pb.h>
 #include <ydb/public/api/protos/ydb_table.pb.h>
@@ -60,6 +69,11 @@ public:
     void AddDataFile(const TString& tablePath, const TString& csvData, ui32 partNum = 0) {
         const TString fullPath = TempDir.Name() + "/" + tablePath;
         WriteDataFileWithChecksum(fullPath, csvData, partNum);
+    }
+
+    void AddCreateTableSql(const TString& tablePath, const TString& sql) {
+        const TString fullPath = TempDir.Name() + "/" + tablePath;
+        WriteFileWithChecksum(fullPath, NYdb::NDump::NFiles::CreateTable().FileName, sql);
     }
 
 private:
@@ -148,9 +162,297 @@ private:
     TTempDir TempDir;
 };
 
+struct TTableSchemeGetterResult {
+    NKikimr::NSchemeShard::TImportInfo::TPtr ImportInfo;
+    ui32 SqlHeadRequests = 0;
+    ui32 SqlGetRequests = 0;
+};
+
+class TSchemeGetterStarter final : public TActorBootstrapped<TSchemeGetterStarter> {
+public:
+    TSchemeGetterStarter(
+            TActorId replyTo,
+            NKikimr::NSchemeShard::TImportInfo::TPtr importInfo)
+        : ReplyTo(replyTo)
+        , ImportInfo(std::move(importInfo))
+    {
+    }
+
+    void Bootstrap() {
+        Register(NKikimr::NSchemeShard::CreateSchemeGetter(ReplyTo, std::move(ImportInfo), 0, {}));
+        PassAway();
+    }
+
+private:
+    const TActorId ReplyTo;
+    NKikimr::NSchemeShard::TImportInfo::TPtr ImportInfo;
+};
+
+TTableSchemeGetterResult RunTableSchemeGetter(
+        TTestBasicRuntime& runtime,
+        const TString& basePath,
+        bool enableTableBackupAsSql)
+{
+    Ydb::Import::ImportFromFsSettings settings;
+    settings.set_base_path(basePath);
+    settings.set_no_acl(true);
+    auto* settingsItem = settings.add_items();
+    settingsItem->set_source_path("backup/Table");
+    settingsItem->set_destination_path("/MyRoot/RestoredTable");
+
+    TTableSchemeGetterResult result;
+    result.ImportInfo = new NKikimr::NSchemeShard::TImportInfo(
+        1,
+        "",
+        NKikimr::NSchemeShard::TImportInfo::EKind::FS,
+        settings,
+        TPathId(),
+        "localhost"
+    );
+    result.ImportInfo->EnableTableBackupAsSql = enableTableBackupAsSql;
+    result.ImportInfo->Items.emplace_back("/MyRoot/RestoredTable");
+
+    const auto previousObserver = runtime.SetObserverFunc([&](TAutoPtr<IEventHandle>& ev) {
+        switch (ev->GetTypeRewrite()) {
+        case NKikimr::NWrappers::NExternalStorage::EvHeadObjectRequest: {
+            const auto& key = ev->Get<NKikimr::NWrappers::NExternalStorage::TEvHeadObjectRequest>()->Request.GetKey();
+            if (TStringBuf(key.data(), key.size()).EndsWith("/create_table.sql")) {
+                ++result.SqlHeadRequests;
+            }
+            break;
+        }
+        case NKikimr::NWrappers::NExternalStorage::EvGetObjectRequest: {
+            const auto& key = ev->Get<NKikimr::NWrappers::NExternalStorage::TEvGetObjectRequest>()->Request.GetKey();
+            if (TStringBuf(key.data(), key.size()).EndsWith("/create_table.sql")) {
+                ++result.SqlGetRequests;
+            }
+            break;
+        }
+        }
+        return TTestActorRuntime::EEventAction::PROCESS;
+    });
+
+    const TActorId replyTo = runtime.AllocateEdgeActor();
+    runtime.Register(new TSchemeGetterStarter(replyTo, result.ImportInfo));
+    const auto ready = runtime.GrabEdgeEvent<NKikimr::NSchemeShard::TEvPrivate::TEvImportSchemeReady>(replyTo, TDuration::Seconds(30));
+    runtime.SetObserverFunc(previousObserver);
+
+    UNIT_ASSERT_C(ready, "scheme getter did not reply");
+    UNIT_ASSERT_C(ready->Get()->Success, ready->Get()->Error);
+    return result;
+}
+
+void ExecuteGenericQuery(TTestBasicRuntime& runtime, const TString& query) {
+    runtime.GetAppData().TenantName = "/MyRoot";
+    const TActorId edge = runtime.AllocateEdgeActor();
+    auto request = MakeHolder<NKikimr::NKqp::TEvKqp::TEvQueryRequest>();
+    request->Record.SetRequestType("_document_api_request");
+    auto& kqpRequest = *request->Record.MutableRequest();
+    kqpRequest.SetDatabase("/MyRoot");
+    kqpRequest.SetAction(NKikimrKqp::QUERY_ACTION_EXECUTE);
+    kqpRequest.SetType(NKikimrKqp::QUERY_TYPE_SQL_GENERIC_QUERY);
+    kqpRequest.SetQuery(query);
+    kqpRequest.MutableTxControl()->mutable_begin_tx()->mutable_serializable_read_write();
+    kqpRequest.MutableTxControl()->set_commit_tx(true);
+    ActorIdToProto(edge, request->Record.MutableRequestActorId());
+
+    runtime.Send(new IEventHandle(
+        NKikimr::NKqp::MakeKqpProxyID(runtime.GetNodeId()), edge, request.Release()));
+    runtime.DispatchEvents(TDispatchOptions(), TDuration::Seconds(1));
+}
+
 } // namespace
 
 Y_UNIT_TEST_SUITE(TImportFromFsTests) {
+    void AssertSqlArtifactImport(
+            TTempBackupFiles& backup,
+            const TString& destination,
+            Ydb::StatusIds::StatusCode expectedStatus,
+            bool skipChecksumValidation = false)
+    {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableFsBackups(true);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+
+        const ui64 importId = 101;
+        TestImport(runtime, importId, "/MyRoot", Sprintf(R"(
+            ImportFromFsSettings {
+              base_path: "%s"
+              skip_checksum_validation: %s
+              items {
+                source_path: "backup/Table"
+                destination_path: "%s"
+              }
+            }
+        )", backup.GetBasePath().c_str(),
+            skipChecksumValidation ? "true" : "false", destination.c_str()));
+        env.TestWaitNotification(runtime, importId);
+        TestGetImport(runtime, importId, "/MyRoot", expectedStatus);
+
+        if (expectedStatus == Ydb::StatusIds::SUCCESS) {
+            TestDescribeResult(DescribePath(runtime, destination), {
+                NLs::Finished,
+                NLs::IsTable,
+            });
+        } else {
+            TestDescribeResult(DescribePath(runtime, destination), {
+                NLs::PathNotExist,
+            });
+        }
+    }
+
+    Y_UNIT_TEST(SqlImportFlagDisabled) {
+        TTempBackupFiles backup;
+        backup.CreateTableBackup("backup/Table", "Table");
+        backup.AddCreateTableSql("backup/Table", "CREATE TABLE source (key Utf8, PRIMARY KEY (key));");
+
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        const auto result = RunTableSchemeGetter(runtime, backup.GetBasePath(), false);
+
+        UNIT_ASSERT_VALUES_EQUAL(result.SqlHeadRequests, 0);
+        UNIT_ASSERT_VALUES_EQUAL(result.SqlGetRequests, 0);
+        UNIT_ASSERT(result.ImportInfo->Items[0].Table);
+        UNIT_ASSERT(result.ImportInfo->Items[0].CreationQuery.empty());
+    }
+
+    Y_UNIT_TEST(SqlImportMissingSql) {
+        TTempBackupFiles backup;
+        backup.CreateTableBackup("backup/Table", "Table");
+
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        const auto result = RunTableSchemeGetter(runtime, backup.GetBasePath(), true);
+
+        // The filesystem storage wrapper forwards each request to its operation actor,
+        // so the runtime observer sees both hops of one logical request.
+        UNIT_ASSERT_VALUES_EQUAL(result.SqlHeadRequests, 2);
+        UNIT_ASSERT_VALUES_EQUAL(result.SqlGetRequests, 0);
+        UNIT_ASSERT(result.ImportInfo->Items[0].Table);
+        UNIT_ASSERT(result.ImportInfo->Items[0].CreationQuery.empty());
+    }
+
+    Y_UNIT_TEST(SqlImportLoadsBothDescriptors) {
+        static const TString Sql = "CREATE TABLE source (key Utf8, PRIMARY KEY (key));";
+        TTempBackupFiles backup;
+        backup.CreateTableBackup("backup/Table", "Table");
+        backup.AddCreateTableSql("backup/Table", Sql);
+
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        const auto result = RunTableSchemeGetter(runtime, backup.GetBasePath(), true);
+
+        UNIT_ASSERT_VALUES_EQUAL(result.SqlHeadRequests, 2);
+        UNIT_ASSERT_VALUES_EQUAL(result.SqlGetRequests, 2);
+        UNIT_ASSERT(result.ImportInfo->Items[0].Table);
+        UNIT_ASSERT_VALUES_EQUAL(result.ImportInfo->Items[0].CreationQuery, Sql);
+    }
+
+    Y_UNIT_TEST(SqlImportRejectsBadSqlChecksum) {
+        TTempBackupFiles backup;
+        backup.CreateTableBackup("backup/Table", "Table");
+        backup.AddCreateTableSql(
+            "backup/Table",
+            "CREATE TABLE source (key Utf8, value Utf8, PRIMARY KEY (key));");
+        TFileOutput checksum(
+            backup.GetBasePath() + "/backup/Table/create_table.sql.sha256");
+        checksum.Write("not-the-sql-checksum");
+        checksum.Finish();
+
+        AssertSqlArtifactImport(
+            backup, "/MyRoot/FsBadSqlChecksum", Ydb::StatusIds::CANCELLED);
+    }
+
+    Y_UNIT_TEST(SqlImportRejectsMissingRequiredSqlChecksum) {
+        TTempBackupFiles backup;
+        backup.CreateTableBackup("backup/Table", "Table");
+        backup.AddCreateTableSql(
+            "backup/Table",
+            "CREATE TABLE source (key Utf8, value Utf8, PRIMARY KEY (key));");
+        UNIT_ASSERT(NFs::Remove(
+            backup.GetBasePath() + "/backup/Table/create_table.sql.sha256"));
+
+        AssertSqlArtifactImport(
+            backup, "/MyRoot/FsMissingSqlChecksum", Ydb::StatusIds::CANCELLED);
+    }
+
+    Y_UNIT_TEST(SqlImportEmptySqlFallsBackToProtobuf) {
+        TTempBackupFiles backup;
+        backup.CreateTableBackup("backup/Table", "Table");
+        backup.AddCreateTableSql("backup/Table", "");
+
+        AssertSqlArtifactImport(
+            backup, "/MyRoot/FsEmptySqlFallback", Ydb::StatusIds::SUCCESS);
+    }
+
+    Y_UNIT_TEST(SqlImportCanSkipBadSqlChecksum) {
+        TTempBackupFiles backup;
+        backup.CreateTableBackup("backup/Table", "Table");
+        backup.AddCreateTableSql(
+            "backup/Table",
+            "CREATE TABLE source (key Utf8, value Utf8, PRIMARY KEY (key));");
+        TFileOutput checksum(
+            backup.GetBasePath() + "/backup/Table/create_table.sql.sha256");
+        checksum.Write("not-the-sql-checksum");
+        checksum.Finish();
+
+        AssertSqlArtifactImport(
+            backup, "/MyRoot/FsSkippedSqlChecksum", Ydb::StatusIds::SUCCESS, true);
+    }
+
+    Y_UNIT_TEST(SqlImportUsesSqlDefinitionAndRestoresData) {
+        TTempBackupFiles backup;
+        backup.CreateTableBackup("backup/Table", "Table");
+        backup.AddDataFile("backup/Table", "\"user1\",\"value1\"\n");
+        backup.AddCreateTableSql("backup/Table", R"(
+            CREATE TABLE `SourceName` (
+                key Utf8,
+                value Utf8 DEFAULT 'sql-default',
+                PRIMARY KEY (key)
+            );
+        )");
+
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableFsBackups(true);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+        ui64 txId = 100;
+
+        TestImport(runtime, ++txId, "/MyRoot", Sprintf(R"(
+            ImportFromFsSettings {
+              base_path: "%s"
+              items {
+                source_path: "backup/Table"
+                destination_path: "/MyRoot/FsSqlRestored"
+              }
+            }
+        )", backup.GetBasePath().c_str()));
+        env.TestWaitNotification(runtime, txId);
+        TestGetImport(runtime, txId, "/MyRoot", Ydb::StatusIds::SUCCESS);
+
+        const auto describe = DescribePath(runtime, "/MyRoot/FsSqlRestored", true, true);
+        UNIT_ASSERT_VALUES_EQUAL(describe.GetStatus(), NKikimrScheme::StatusSuccess);
+        const auto& columns = describe.GetPathDescription().GetTable().GetColumns();
+        const auto valueColumn = FindIf(columns, [](const auto& column) {
+            return column.GetName() == "value";
+        });
+        UNIT_ASSERT(valueColumn != columns.end());
+        UNIT_ASSERT(valueColumn->HasDefaultFromLiteral());
+        const auto& defaultValue = valueColumn->GetDefaultFromLiteral().Getvalue();
+        const TString literal = defaultValue.Hastext_value()
+            ? defaultValue.Gettext_value()
+            : defaultValue.Getitems(0).Gettext_value();
+        UNIT_ASSERT_VALUES_EQUAL(literal, "sql-default");
+        UNIT_ASSERT_VALUES_EQUAL(CountRows(runtime, "/MyRoot/FsSqlRestored"), 1);
+    }
+
     Y_UNIT_TEST(ShouldSucceedCreateImportFromFs) {
         TTestBasicRuntime runtime;
         TTestEnv env(runtime);
@@ -470,13 +772,17 @@ Y_UNIT_TEST_SUITE(TImportFromFsTests) {
         UNIT_ASSERT_VALUES_EQUAL(totalRows, 4);
     }
 
-    void ExportImportWithDataValidationImpl(bool encrypted) {
+    void ExportImportWithDataValidationImpl(bool encrypted, bool sqlImport = false) {
         TTempDir tempDir;
         TTestBasicRuntime runtime;
-        TTestEnv env(runtime);
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(sqlImport)
+            .SetupKqpProxy(sqlImport);
+        TTestEnv env(runtime, options);
         ui64 txId = 100;
         runtime.GetAppData().FeatureFlags.SetEnableFsBackups(true);
         runtime.GetAppData().FeatureFlags.SetEnableEncryptedExport(encrypted);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(sqlImport);
         runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NActors::NLog::PRI_TRACE);
         runtime.SetLogPriority(NKikimrServices::DATASHARD_BACKUP, NActors::NLog::PRI_TRACE);
         runtime.SetLogPriority(NKikimrServices::EXPORT, NActors::NLog::PRI_TRACE);
@@ -538,6 +844,11 @@ Y_UNIT_TEST_SUITE(TImportFromFsTests) {
         UNIT_ASSERT_VALUES_EQUAL(exportEntry.GetProgress(), Ydb::Export::ExportProgress::PROGRESS_DONE);
         UNIT_ASSERT(exportEntry.HasStartTime());
         UNIT_ASSERT(exportEntry.HasEndTime());
+        if (sqlImport) {
+            UNIT_ASSERT_C(
+                NFs::Exists(basePath + "/backup/OriginalTable/create_table.sql"),
+                "current filesystem export did not produce create_table.sql");
+        }
 
         // Step 4: Import from FS to a new table
         TString importSettings = Sprintf(R"(
@@ -551,6 +862,27 @@ Y_UNIT_TEST_SUITE(TImportFromFsTests) {
             }
         )", basePath.c_str(), encryptionSettings.c_str());
 
+        bool compilerSucceeded = false;
+        bool proposedPreparedSql = false;
+        const auto previousObserver = runtime.SetObserverFunc([&](TAutoPtr<IEventHandle>& ev) {
+            if (ev->GetTypeRewrite() == NKikimr::NSchemeShard::TEvPrivate::EvImportSchemeQueryResult) {
+                const auto* result = ev->Get<NKikimr::NSchemeShard::TEvPrivate::TEvImportSchemeQueryResult>();
+                compilerSucceeded = compilerSucceeded
+                    || result->Status == Ydb::StatusIds::SUCCESS;
+            } else if (ev->GetTypeRewrite() == NKikimr::NSchemeShard::TEvSchemeShard::EvModifySchemeTransaction) {
+                const auto& record = ev->Get<NKikimr::NSchemeShard::TEvSchemeShard::TEvModifySchemeTransaction>()->Record;
+                if (record.TransactionSize() == 1) {
+                    const auto& modify = record.GetTransaction(0);
+                    if (modify.GetOperationType() == NKikimrSchemeOp::ESchemeOpCreateIndexedTable
+                        && modify.GetCreateIndexedTable().GetTableDescription().GetName() == "RestoredTable")
+                    {
+                        proposedPreparedSql = modify.GetFailedOnAlreadyExists();
+                    }
+                }
+            }
+            return TTestActorRuntime::EEventAction::PROCESS;
+        });
+
         TestImport(runtime, ++txId, "/MyRoot", importSettings);
         const ui64 importId = txId;
         env.TestWaitNotification(runtime, importId);
@@ -559,6 +891,11 @@ Y_UNIT_TEST_SUITE(TImportFromFsTests) {
         auto importResponse = TestGetImport(runtime, importId, "/MyRoot", Ydb::StatusIds::SUCCESS);
         const auto& importEntry = importResponse.GetResponse().GetEntry();
         UNIT_ASSERT_VALUES_EQUAL(importEntry.GetProgress(), Ydb::Import::ImportProgress::PROGRESS_DONE);
+        runtime.SetObserverFunc(previousObserver);
+        if (sqlImport) {
+            UNIT_ASSERT_C(compilerSucceeded, "current filesystem-export SQL was not compiled");
+            UNIT_ASSERT_C(proposedPreparedSql, "current filesystem-export SQL operation was not proposed");
+        }
 
         // Step 5: Verify restored table exists
         auto describe = DescribePath(runtime, "/MyRoot/RestoredTable");
@@ -597,6 +934,119 @@ Y_UNIT_TEST_SUITE(TImportFromFsTests) {
 
     Y_UNIT_TEST(ShouldExportThenImportWithDataValidationEncrypted) {
         ExportImportWithDataValidationImpl(true);
+    }
+
+    Y_UNIT_TEST(SqlImportCurrentExportRowTableRoundTrip) {
+        ExportImportWithDataValidationImpl(false, true);
+    }
+
+    Y_UNIT_TEST(SqlImportCurrentExportColumnTableRoundTrip) {
+        TTempDir tempDir;
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableFsBackups(true);
+        runtime.GetAppData().FeatureFlags.SetEnableColumnTablesBackup(true);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+
+        ui64 txId = 100;
+        TestCreateColumnTable(runtime, ++txId, "/MyRoot", R"(
+            Name: "FsSqlCurrentColumnOriginal"
+            ColumnShardCount: 1
+            Schema {
+                Columns { Name: "timestamp" Type: "Uint64" NotNull: true }
+                Columns { Name: "value" Type: "Utf8" }
+                KeyColumnNames: "timestamp"
+            }
+        )");
+        env.TestWaitNotification(runtime, txId);
+        ExecuteGenericQuery(runtime, R"(
+            UPSERT INTO `/MyRoot/FsSqlCurrentColumnOriginal` (timestamp, value)
+            VALUES (1, Utf8("valueA"));
+        )");
+
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+        NKikimr::NWrappers::NTestHelpers::TS3Mock s3Mock(
+            {}, NKikimr::NWrappers::NTestHelpers::TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        TestExport(runtime, ++txId, "/MyRoot", Sprintf(R"(
+            ExportToS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_path: "/MyRoot/FsSqlCurrentColumnOriginal"
+                destination_prefix: "FsSqlCurrentColumn"
+              }
+            }
+        )", port));
+        env.TestWaitNotification(runtime, txId);
+        TestGetExport(runtime, txId, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        UNIT_ASSERT_C(s3Mock.GetData().contains("/FsSqlCurrentColumn/create_table.sql"),
+            "current column-table export did not produce create_table.sql");
+
+        const TString basePath = tempDir.Path();
+        const TString destinationDir = basePath + "/backup/ColumnTable";
+        MakePathIfNotExist(destinationDir.c_str());
+        const TString sourcePrefix = "/FsSqlCurrentColumn/";
+        for (const auto& [key, content] : s3Mock.GetData()) {
+            if (!TStringBuf(key).StartsWith(sourcePrefix)) {
+                continue;
+            }
+            TFileOutput file(destinationDir + "/" + key.substr(sourcePrefix.size()));
+            file.Write(content);
+            file.Finish();
+        }
+
+        bool compilerSucceeded = false;
+        bool proposedPreparedSql = false;
+        ui64 writtenRows = 0;
+        const auto previousObserver = runtime.SetObserverFunc([&](TAutoPtr<IEventHandle>& ev) {
+            if (ev->GetTypeRewrite() == NKikimr::NSchemeShard::TEvPrivate::EvImportSchemeQueryResult) {
+                const auto* result = ev->Get<NKikimr::NSchemeShard::TEvPrivate::TEvImportSchemeQueryResult>();
+                compilerSucceeded = compilerSucceeded
+                    || result->Status == Ydb::StatusIds::SUCCESS;
+            } else if (ev->GetTypeRewrite() == NKikimr::NSchemeShard::TEvSchemeShard::EvModifySchemeTransaction) {
+                const auto& record = ev->Get<NKikimr::NSchemeShard::TEvSchemeShard::TEvModifySchemeTransaction>()->Record;
+                if (record.TransactionSize() == 1) {
+                    const auto& modify = record.GetTransaction(0);
+                    if (modify.GetOperationType() == NKikimrSchemeOp::ESchemeOpCreateColumnTable
+                        && modify.GetCreateColumnTable().GetName() == "FsSqlCurrentColumnRestored")
+                    {
+                        proposedPreparedSql = modify.GetFailedOnAlreadyExists();
+                    }
+                }
+            } else if (ev->GetTypeRewrite() == NKikimr::TEvDataShard::EvS3UploadRowsResponse) {
+                writtenRows = Max(
+                    writtenRows,
+                    ev->Get<NKikimr::TEvDataShard::TEvS3UploadRowsResponse>()->Info.WrittenRows);
+            }
+            return TTestActorRuntime::EEventAction::PROCESS;
+        });
+
+        TestImport(runtime, ++txId, "/MyRoot", Sprintf(R"(
+            ImportFromFsSettings {
+              base_path: "%s"
+              items {
+                source_path: "backup/ColumnTable"
+                destination_path: "/MyRoot/FsSqlCurrentColumnRestored"
+              }
+            }
+        )", basePath.c_str()));
+        env.TestWaitNotification(runtime, txId);
+        TestGetImport(runtime, txId, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        runtime.SetObserverFunc(previousObserver);
+
+        UNIT_ASSERT_C(compilerSucceeded, "current filesystem column-table SQL was not compiled");
+        UNIT_ASSERT_C(proposedPreparedSql, "current filesystem column-table SQL operation was not proposed");
+        const auto describe = DescribePrivatePath(
+            runtime, "/MyRoot/FsSqlCurrentColumnRestored", true, true);
+        UNIT_ASSERT_VALUES_EQUAL(describe.GetStatus(), NKikimrScheme::StatusSuccess);
+        UNIT_ASSERT(describe.GetPathDescription().HasColumnTableDescription());
+        UNIT_ASSERT_VALUES_EQUAL(writtenRows, 1);
     }
 
     Y_UNIT_TEST(MaterializedIndexFs) {

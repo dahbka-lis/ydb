@@ -5288,6 +5288,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                         importInfo->UserSID = rowset.GetValue<Schema::Imports::UserSID>();
                     }
                     importInfo->SanitizedToken = rowset.GetValueOrDefault<Schema::Imports::SanitizedToken>();
+                    importInfo->EnableTableBackupAsSql = rowset.GetValueOrDefault<Schema::Imports::EnableTableBackupAsSql>(false);
 
                     ui32 items = rowset.GetValue<Schema::Imports::Items>();
                     importInfo->Items.resize(items);

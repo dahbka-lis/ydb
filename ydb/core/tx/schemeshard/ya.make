@@ -299,6 +299,7 @@ SRCS(
     schemeshard_import__list.cpp
     schemeshard_import_flow_proposals.cpp
     schemeshard_import_scheme_query_executor.cpp
+    schemeshard_import_table_sql.cpp
     schemeshard_info_types.cpp
     schemeshard_info_types.h
     schemeshard_path.cpp
@@ -415,6 +416,7 @@ PEERDIR(
     ydb/public/lib/ydb_cli/dump/files
     ydb/public/lib/ydb_cli/dump/util
     yql/essentials/minikql
+    yql/essentials/ast
     yql/essentials/providers/common/proto
     ydb/services/bg_tasks
     ydb/core/tx/columnshard/bg_tasks/manager

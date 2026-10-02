@@ -249,7 +249,8 @@ void TSchemeShard::PersistCreateImport(NIceDb::TNiceDb& db, const TImportInfo& i
         NIceDb::TUpdate<Schema::Imports::DomainPathLocalId>(importInfo.DomainPathId.LocalPathId),
         NIceDb::TUpdate<Schema::Imports::Items>(importInfo.Items.size()),
         NIceDb::TUpdate<Schema::Imports::PeerName>(importInfo.PeerName),
-        NIceDb::TUpdate<Schema::Imports::SanitizedToken>(importInfo.SanitizedToken)
+        NIceDb::TUpdate<Schema::Imports::SanitizedToken>(importInfo.SanitizedToken),
+        NIceDb::TUpdate<Schema::Imports::EnableTableBackupAsSql>(importInfo.EnableTableBackupAsSql)
     );
 
     if (importInfo.UserSID) {
@@ -374,11 +375,7 @@ void TSchemeShard::PersistImportItemScheme(NIceDb::TNiceDb& db, const TImportInf
         );
     }
 
-    if (!item.CreationQuery.empty()) {
-        record.Update(
-            NIceDb::TUpdate<Schema::ImportItems::CreationQuery>(item.CreationQuery)
-        );
-    }
+    PersistImportItemCreationQuery(db, importInfo, itemIdx);
 
     if (item.Permissions.Defined()) {
         record.Update(
@@ -395,6 +392,20 @@ void TSchemeShard::PersistImportItemScheme(NIceDb::TNiceDb& db, const TImportInf
     );
 }
 
+void TSchemeShard::PersistImportItemCreationQuery(NIceDb::TNiceDb& db, const TImportInfo& importInfo, ui32 itemIdx) {
+    Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
+    const auto& item = importInfo.Items[itemIdx];
+    auto record = db.Table<Schema::ImportItems>().Key(importInfo.Id, itemIdx);
+
+    if (item.CreationQuery.empty()) {
+        record.Update(NIceDb::TNull<Schema::ImportItems::CreationQuery>());
+    } else {
+        record.Update(
+            NIceDb::TUpdate<Schema::ImportItems::CreationQuery>(item.CreationQuery)
+        );
+    }
+}
+
 void TSchemeShard::PersistImportItemPreparedCreationQuery(NIceDb::TNiceDb& db, const TImportInfo& importInfo, ui32 itemIdx) {
     Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
     const auto& item = importInfo.Items[itemIdx];
@@ -402,6 +413,10 @@ void TSchemeShard::PersistImportItemPreparedCreationQuery(NIceDb::TNiceDb& db, c
     if (item.PreparedCreationQuery) {
         db.Table<Schema::ImportItems>().Key(importInfo.Id, itemIdx).Update(
             NIceDb::TUpdate<Schema::ImportItems::PreparedCreationQuery>(item.PreparedCreationQuery->SerializeAsString())
+        );
+    } else {
+        db.Table<Schema::ImportItems>().Key(importInfo.Id, itemIdx).Update(
+            NIceDb::TNull<Schema::ImportItems::PreparedCreationQuery>()
         );
     }
 }

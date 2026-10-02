@@ -3841,6 +3841,8 @@ struct TImportInfo: public TSimpleRefCount<TImportInfo> {
     TInstant StartTime = TInstant::Zero();
     TInstant EndTime = TInstant::Zero();
 
+    bool EnableTableBackupAsSql = false;
+
     TMaybe<std::vector<TRegExMatch>> ExcludeRegexps;
 
 private:

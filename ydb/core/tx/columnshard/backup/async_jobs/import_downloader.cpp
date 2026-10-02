@@ -22,10 +22,13 @@ TConclusion<std::unique_ptr<NActors::IActor>> CreateAsyncJobImportDownloader(con
     const auto settingsKind = restoreTask.GetSettingsCase();
     switch (settingsKind) {
         case NKikimrSchemeOp::TRestoreTask::kS3Settings:
+        case NKikimrSchemeOp::TRestoreTask::kFSSettings:
 #ifndef KIKIMR_DISABLE_S3_OPS
             return std::unique_ptr<NActors::IActor>(CreateS3Downloader(subscriberActorId, txId, restoreTask, tableInfo));
 #else
-            return TConclusionStatus::Fail("Import from S3 are disabled");
+            return TConclusionStatus::Fail(TStringBuilder() << "Imports from "
+                << (settingsKind == NKikimrSchemeOp::TRestoreTask::kS3Settings ? "S3" : "FS")
+                << " are disabled");
 #endif
         default:
             return TConclusionStatus::Fail(TStringBuilder() << "Unknown settings: " << static_cast<ui32>(settingsKind));

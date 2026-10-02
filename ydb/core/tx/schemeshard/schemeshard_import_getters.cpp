@@ -497,6 +497,30 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
         GetObject(SchemeKey, result.GetResult().GetContentLength());
     }
 
+    void HandleTableCreationQuery(TEvExternalStorage::TEvHeadObjectResponse::TPtr& ev) {
+        const auto& result = ev->Get()->Result;
+
+        YDB_LOG_DEBUG("HandleTableCreationQuery TEvExternalStorage::TEvHeadObjectResponse",
+            {"self", SelfId()},
+            {"result", result},
+        );
+
+        if (IsNoSuchKeyError(result)) {
+            return ContinueAfterScheme();
+        }
+
+        if (!CheckResult(result, "HeadObject")) {
+            return;
+        }
+
+        const ui64 contentLength = result.GetResult().GetContentLength();
+        if (contentLength) {
+            GetObject(TableCreationQueryKey, contentLength);
+        } else {
+            HandleTableCreationQueryContent({});
+        }
+    }
+
     void HandlePermissions(TEvExternalStorage::TEvHeadObjectResponse::TPtr& ev) {
         const auto& result = ev->Get()->Result;
 
@@ -678,11 +702,7 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
         }
 
         auto nextStep = [this]() {
-            if (NeedDownloadPermissions) {
-                StartDownloadingPermissions();
-            } else {
-                StartCheckingMaterializedIndexes();
-            }
+            StartDownloadingTableCreationQuery();
         };
 
         if (NeedValidateChecksums) {
@@ -690,6 +710,22 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
         } else {
             nextStep();
         }
+    }
+
+    void HandleTableCreationQuery(TEvExternalStorage::TEvGetObjectResponse::TPtr& ev) {
+        const auto& msg = *ev->Get();
+        const auto& result = msg.Result;
+
+        YDB_LOG_DEBUG("HandleTableCreationQuery TEvExternalStorage::TEvGetObjectResponse",
+            {"self", SelfId()},
+            {"result", result},
+        );
+
+        if (!CheckResult(result, "GetObject")) {
+            return;
+        }
+
+        HandleTableCreationQueryContent(msg.Body);
     }
 
     void HandlePermissions(TEvExternalStorage::TEvGetObjectResponse::TPtr& ev) {
@@ -938,6 +974,10 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
         Download(SchemeKey);
     }
 
+    void DownloadTableCreationQuery() {
+        Download(TableCreationQueryKey);
+    }
+
     void DownloadPermissions() {
         Download(PermissionsKey);
     }
@@ -1043,6 +1083,49 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
         Become(&TThis::StateDownloadScheme);
     }
 
+    void ContinueAfterScheme() {
+        if (NeedDownloadPermissions) {
+            StartDownloadingPermissions();
+        } else {
+            StartCheckingMaterializedIndexes();
+        }
+    }
+
+    void HandleTableCreationQueryContent(const TString& encryptedContent) {
+        TString content;
+        if (!MaybeDecrypt(encryptedContent, content, NBackup::EBackupFileType::TableCreate)) {
+            return;
+        }
+
+        TableCreationQueryContent = std::move(content);
+        auto nextStep = [this]() {
+            if (TableCreationQueryContent) {
+                Y_ABORT_UNLESS(ItemIdx < ImportInfo->Items.size());
+                ImportInfo->Items.at(ItemIdx).CreationQuery = std::move(TableCreationQueryContent);
+            }
+            ContinueAfterScheme();
+        };
+
+        if (NeedValidateChecksums) {
+            StartValidatingChecksum(TableCreationQueryKey, TableCreationQueryContent, nextStep);
+        } else {
+            nextStep();
+        }
+    }
+
+    void StartDownloadingTableCreationQuery() {
+        Y_ABORT_UNLESS(ItemIdx < ImportInfo->Items.size());
+        const auto& item = ImportInfo->Items.at(ItemIdx);
+        const bool isTopLevelTable = IsTable(SchemeKey) && item.ParentIdx == Max<ui32>();
+        if (!ImportInfo->EnableTableBackupAsSql || !isTopLevelTable) {
+            return ContinueAfterScheme();
+        }
+
+        ResetRetries();
+        DownloadTableCreationQuery();
+        Become(&TThis::StateDownloadTableCreationQuery);
+    }
+
     void StartDownloadingPermissions() {
         ResetRetries();
         DownloadPermissions();
@@ -1071,6 +1154,7 @@ public:
         , ItemIdx(itemIdx)
         , MetadataKey(MetadataKeyFromSettings(*ImportInfo, itemIdx))
         , SchemeKey(SchemeKeyFromSettings(*ImportInfo, itemIdx, "scheme.pb"))
+        , TableCreationQueryKey(SchemeKeyFromSettings(*ImportInfo, itemIdx, NYdb::NDump::NFiles::CreateTable().FileName))
         , PermissionsKey(PermissionsKeyFromSettings(*ImportInfo, itemIdx))
         , IndexPopulationMode(ImportInfo->GetIndexPopulationMode())
         , NeedDownloadPermissions(!ImportInfo->GetNoAcl())
@@ -1109,6 +1193,16 @@ public:
             hFunc(TEvExternalStorage::TEvGetObjectResponse, HandlePermissions);
 
             sFunc(TEvents::TEvWakeup, DownloadPermissions);
+            sFunc(TEvents::TEvPoisonPill, PassAway);
+        }
+    }
+
+    STATEFN(StateDownloadTableCreationQuery) {
+        switch (ev->GetTypeRewrite()) {
+            hFunc(TEvExternalStorage::TEvHeadObjectResponse, HandleTableCreationQuery);
+            hFunc(TEvExternalStorage::TEvGetObjectResponse, HandleTableCreationQuery);
+
+            sFunc(TEvents::TEvWakeup, DownloadTableCreationQuery);
             sFunc(TEvents::TEvPoisonPill, PassAway);
         }
     }
@@ -1152,6 +1246,8 @@ private:
     const TString MetadataKey;
     TString SchemeKey;
     NBackup::EBackupFileType SchemeFileType = NBackup::EBackupFileType::TableSchema;
+    const TString TableCreationQueryKey;
+    TString TableCreationQueryContent;
     const TString PermissionsKey;
     ui32 SchemePropertiesIdx = 0;
 

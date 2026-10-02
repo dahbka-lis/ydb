@@ -1711,6 +1711,7 @@ public:
     static void PersistImportSettings(NIceDb::TNiceDb& db, const TImportInfo& importInfo);
     static void PersistImportItemState(NIceDb::TNiceDb& db, const TImportInfo& importInfo, ui32 itemIdx);
     static void PersistImportItemScheme(NIceDb::TNiceDb& db, const TImportInfo& importInfo, ui32 itemIdx);
+    static void PersistImportItemCreationQuery(NIceDb::TNiceDb& db, const TImportInfo& importInfo, ui32 itemIdx);
     static void PersistImportItemPreparedCreationQuery(NIceDb::TNiceDb& db, const TImportInfo& importInfo, ui32 itemIdx);
     static void PersistImportItemDstPathId(NIceDb::TNiceDb& db, const TImportInfo& importInfo, ui32 itemIdx);
     static void EraseEncryptionKey(NIceDb::TNiceDb& db, TImportInfo& importInfo); // Erases encryption key (if any) for the import after moving to the final state and persists it in the database

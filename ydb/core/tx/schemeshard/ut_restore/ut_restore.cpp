@@ -1,11 +1,14 @@
 #include "ut_helpers/ut_backup_restore_common.h"
 
 #include <ydb/public/api/protos/ydb_import.pb.h>
+#include <ydb/public/lib/ydb_cli/dump/files/files.h>
 
 #include <ydb/core/backup/common/checksum.h>
 #include <ydb/core/backup/common/encryption.h>
 #include <ydb/core/base/localdb.h>
 #include <ydb/core/base/table_index.h>
+#include <ydb/core/kqp/common/events/query.h>
+#include <ydb/core/kqp/common/simple/services.h>
 #include <ydb/core/kqp/ut/common/kqp_ut_common.h>
 #include <ydb/core/metering/metering.h>
 #include <ydb/core/protos/schemeshard/operations.pb.h>
@@ -17,8 +20,11 @@
 #include <ydb/core/testlib/audit_helpers/audit_helper.h>
 #include <ydb/core/tx/datashard/datashard.h>
 #include <ydb/core/tx/schemeshard/schemeshard_billing_helpers.h>
+#include <ydb/core/tx/schemeshard/schemeshard_import_getters.h>
+#include <ydb/core/tx/schemeshard/schemeshard_import_scheme_query_executor.h>
 #include <ydb/core/tx/schemeshard/schemeshard_private.h>
 #include <ydb/core/tx/schemeshard/ut_helpers/helpers.h>
+#include <ydb/core/tx/schemeshard/ut_helpers/local_indexes.h>
 #include <ydb/core/tx/schemeshard/ut_helpers/test_with_reboots.h>
 #include <ydb/core/wrappers/events/get_object.h>
 #include <ydb/core/wrappers/ut_helpers/s3_mock.h>
@@ -49,6 +55,7 @@
 #include <util/string/join.h>
 #include <util/string/printf.h>
 
+#include <atomic>
 #include <regex>
 
 using namespace NKikimr::NSchemeShard;
@@ -228,6 +235,52 @@ namespace {
         }
     };
 
+    TMaybe<TString> GetUtf8LiteralDefault(
+            const NKikimrSchemeOp::TTableDescription& table,
+            const TString& columnName)
+    {
+        for (const auto& column : table.GetColumns()) {
+            if (column.GetName() != columnName || !column.HasDefaultFromLiteral()) {
+                continue;
+            }
+
+            const auto& value = column.GetDefaultFromLiteral().Getvalue();
+            if (value.Hastext_value()) {
+                return value.Gettext_value();
+            }
+            if (value.items_size() == 1 && value.Getitems(0).Hastext_value()) {
+                return value.Getitems(0).Gettext_value();
+            }
+        }
+        return Nothing();
+    }
+
+    void ExecuteDataQuery(
+            TTestBasicRuntime& runtime,
+            const TString& query,
+            NKikimrKqp::EQueryType queryType = NKikimrKqp::QUERY_TYPE_SQL_DML)
+    {
+        runtime.GetAppData().TenantName = "/MyRoot";
+        const TActorId edge = runtime.AllocateEdgeActor();
+        auto request = MakeHolder<NKqp::TEvKqp::TEvQueryRequest>();
+        request->Record.SetRequestType("_document_api_request");
+        auto& kqpRequest = *request->Record.MutableRequest();
+        kqpRequest.SetDatabase("/MyRoot");
+        kqpRequest.SetAction(NKikimrKqp::QUERY_ACTION_EXECUTE);
+        kqpRequest.SetType(queryType);
+        kqpRequest.SetQuery(query);
+        kqpRequest.MutableTxControl()->mutable_begin_tx()->mutable_serializable_read_write();
+        kqpRequest.MutableTxControl()->set_commit_tx(true);
+        ActorIdToProto(edge, request->Record.MutableRequestActorId());
+
+        runtime.Send(new IEventHandle(
+            NKqp::MakeKqpProxyID(runtime.GetNodeId()), edge, request.Release()));
+        // The SchemeShard test runtime uses a fake coordinator that does not
+        // complete the client-side KQP response lifecycle. Drive the request
+        // through commit; callers verify the inserted row directly.
+        runtime.DispatchEvents(TDispatchOptions(), TDuration::Seconds(1));
+    }
+
     TTestData GenerateTestData(const TString& keyPrefix, ui32 count) {
         TStringBuilder csv;
         TStringBuilder yson;
@@ -400,6 +453,13 @@ namespace {
                 if (withChecksum) {
                     result.emplace(NBackup::ChecksumKey(schemeKey), item.Scheme.Checksum);
                 }
+                if (item.CreationQuery) {
+                    auto createTableKey = prefix + "/" + NYdb::NDump::NFiles::CreateTable().FileName;
+                    result.emplace(createTableKey, item.CreationQuery);
+                    if (withChecksum) {
+                        result.emplace(NBackup::ChecksumKey(createTableKey), item.CreationQuery.Checksum);
+                    }
+                }
                 break;
             }
             case EPathTypeView: {
@@ -506,6 +566,123 @@ namespace {
     };
 
     using TDelayFunc = std::function<bool(TAutoPtr<IEventHandle>&)>;
+
+    struct TTableSchemeGetterResult {
+        TImportInfo::TPtr ImportInfo;
+        ui32 SqlHeadRequests = 0;
+        ui32 SqlGetRequests = 0;
+    };
+
+    class TSchemeGetterStarter final : public TActorBootstrapped<TSchemeGetterStarter> {
+    public:
+        TSchemeGetterStarter(TActorId replyTo, TImportInfo::TPtr importInfo)
+            : ReplyTo(replyTo)
+            , ImportInfo(std::move(importInfo))
+        {
+        }
+
+        void Bootstrap() {
+            Register(CreateSchemeGetter(ReplyTo, std::move(ImportInfo), 0, {}));
+            PassAway();
+        }
+
+    private:
+        const TActorId ReplyTo;
+        TImportInfo::TPtr ImportInfo;
+    };
+
+    TTableSchemeGetterResult RunTableSchemeGetter(
+            TTestBasicRuntime& runtime,
+            ui16 port,
+            bool enableTableBackupAsSql)
+    {
+        Ydb::Import::ImportFromS3Settings settings;
+        settings.set_endpoint(TStringBuilder() << "localhost:" << port);
+        settings.set_scheme(Ydb::Import::ImportFromS3Settings::HTTP);
+        settings.set_no_acl(true);
+        auto* settingsItem = settings.add_items();
+        settingsItem->set_source_prefix("");
+        settingsItem->set_destination_path("/MyRoot/Table");
+
+        TTableSchemeGetterResult result;
+        result.ImportInfo = new TImportInfo(
+            1,
+            "",
+            TImportInfo::EKind::S3,
+            settings,
+            TPathId(),
+            "localhost"
+        );
+        result.ImportInfo->EnableTableBackupAsSql = enableTableBackupAsSql;
+        result.ImportInfo->Items.emplace_back("/MyRoot/Table");
+
+        const auto previousObserver = runtime.SetObserverFunc([&](TAutoPtr<IEventHandle>& ev) {
+            switch (ev->GetTypeRewrite()) {
+            case NWrappers::NExternalStorage::EvHeadObjectRequest: {
+                const auto& key = ev->Get<NWrappers::NExternalStorage::TEvHeadObjectRequest>()->Request.GetKey();
+                if (TStringBuf(key.data(), key.size()).EndsWith("/create_table.sql")) {
+                    ++result.SqlHeadRequests;
+                }
+                break;
+            }
+            case NWrappers::NExternalStorage::EvGetObjectRequest: {
+                const auto& key = ev->Get<NWrappers::NExternalStorage::TEvGetObjectRequest>()->Request.GetKey();
+                if (TStringBuf(key.data(), key.size()).EndsWith("/create_table.sql")) {
+                    ++result.SqlGetRequests;
+                }
+                break;
+            }
+            }
+            return TTestActorRuntime::EEventAction::PROCESS;
+        });
+
+        const TActorId replyTo = runtime.AllocateEdgeActor();
+        runtime.Register(new TSchemeGetterStarter(replyTo, result.ImportInfo));
+        const auto ready = runtime.GrabEdgeEvent<TEvPrivate::TEvImportSchemeReady>(replyTo, TDuration::Seconds(30));
+        runtime.SetObserverFunc(previousObserver);
+
+        UNIT_ASSERT_C(ready, "scheme getter did not reply");
+        UNIT_ASSERT_C(ready->Get()->Success, ready->Get()->Error);
+        return result;
+    }
+
+    struct TCompiledSchemeQueryResult {
+        Ydb::StatusIds::StatusCode Status;
+        std::variant<TString, NKikimrSchemeOp::TModifyScheme> Result;
+    };
+
+    TCompiledSchemeQueryResult CompileTableSchemeQuery(
+            TTestBasicRuntime& runtime,
+            const TString& query)
+    {
+        const TActorId replyTo = runtime.AllocateEdgeActor();
+        runtime.Register(CreateSchemeQueryExecutor(
+            replyTo,
+            1,
+            0,
+            query,
+            "/MyRoot",
+            EImportSchemeQueryKind::Table));
+
+        const auto response = runtime.GrabEdgeEvent<TEvPrivate::TEvImportSchemeQueryResult>(
+            replyTo,
+            TDuration::Seconds(30));
+        UNIT_ASSERT_C(response, "scheme query executor did not reply");
+        return {response->Get()->Status, response->Get()->Result};
+    }
+
+    NKikimrSchemeOp::TModifyScheme CompileTableSchemeQuerySuccessfully(
+            TTestBasicRuntime& runtime,
+            const TString& query)
+    {
+        auto result = CompileTableSchemeQuery(runtime, query);
+        const auto* error = std::get_if<TString>(&result.Result);
+        if (error) {
+            UNIT_FAIL(*error);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(result.Status, Ydb::StatusIds::SUCCESS);
+        return std::get<NKikimrSchemeOp::TModifyScheme>(std::move(result.Result));
+    }
 
     auto SetDelayObserver(TTestActorRuntime& runtime, THolder<IEventHandle>& delayed, TDelayFunc delayFunc) {
         return runtime.SetObserverFunc([&](TAutoPtr<IEventHandle>& ev) {
@@ -3688,10 +3865,1333 @@ Y_UNIT_TEST_SUITE(TRestoreWithRebootsTests) {
 }
 
 Y_UNIT_TEST_SUITE(TImportTests) {
+    void Run(
+        TTestBasicRuntime& runtime,
+        TTestEnv& env,
+        THashMap<TString, TString>&& data,
+        const TString& request,
+        Ydb::StatusIds::StatusCode expectedStatus = Ydb::StatusIds::SUCCESS,
+        const TString& dbName = "/MyRoot",
+        bool serverless = false,
+        const TString& userSID = "",
+        const TString& peerName = "");
+
+    TTestDataWithScheme MakeSqlGetterTableData(const TString& sql = {}) {
+        auto data = GenerateTestData(R"(
+            columns {
+              name: "key"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            columns {
+              name: "value"
+              type { optional_type { item { type_id: UTF8 } } }
+              from_literal {
+                type { type_id: UTF8 }
+                value { text_value: "protobuf-default" }
+              }
+            }
+            primary_key: "key"
+        )");
+
+        NBackup::TMetadata metadata;
+        metadata.SetVersion(1);
+        data.Metadata = metadata.Serialize();
+        data.CreationQuery = sql;
+        return data;
+    }
+
+    void AssertSqlImportFallsBackToProtobuf(const TString& sql, const TString& destination) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+
+        Run(runtime, env, ConvertTestData(MakeSqlGetterTableData(sql)), Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "%s"
+              }
+            }
+        )", destination.c_str()));
+
+        const auto describe = DescribePath(runtime, destination, true, true);
+        UNIT_ASSERT_VALUES_EQUAL(describe.GetStatus(), NKikimrScheme::StatusSuccess);
+        const auto literal = GetUtf8LiteralDefault(describe.GetPathDescription().GetTable(), "value");
+        UNIT_ASSERT_C(literal, "protobuf literal default was not retained after SQL fallback");
+        UNIT_ASSERT_VALUES_EQUAL(*literal, "protobuf-default");
+
+        const auto response = TestGetImport(runtime, 101, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        UNIT_ASSERT_C(response.GetResponse().GetEntry().GetIssues().empty(),
+            "successful SQL fallback must not be exposed as an import issue");
+    }
+
+    void AssertSqlArtifactImport(
+            THashMap<TString, TString>&& objects,
+            const TString& destination,
+            Ydb::StatusIds::StatusCode expectedStatus,
+            bool skipChecksumValidation = false)
+    {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+
+        Run(runtime, env, std::move(objects), Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%%d"
+              scheme: HTTP
+              skip_checksum_validation: %s
+              items {
+                source_prefix: ""
+                destination_path: "%s"
+              }
+            }
+        )", skipChecksumValidation ? "true" : "false", destination.c_str()), expectedStatus);
+
+        if (expectedStatus == Ydb::StatusIds::SUCCESS) {
+            TestDescribeResult(DescribePath(runtime, destination), {
+                NLs::Finished,
+                NLs::IsTable,
+            });
+        } else {
+            TestDescribeResult(DescribePath(runtime, destination), {
+                NLs::PathNotExist,
+            });
+        }
+    }
+
+    TString MakeS3ErrorResponse(TStringBuf status, TStringBuf code, TStringBuf message) {
+        const TString body = TStringBuilder()
+            << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            << "<Error><Code>" << code << "</Code><Message>" << message << "</Message></Error>";
+        return TStringBuilder()
+            << "HTTP/1.1 " << status << "\r\n"
+            << "Content-Type: application/xml\r\n"
+            << "Content-Length: " << body.size() << "\r\n"
+            << "Connection: close\r\n\r\n"
+            << body;
+    }
+
+    void AssertSqlArtifactStorageBehavior(
+            const TString& destination,
+            ui32 retries,
+            Ydb::StatusIds::StatusCode expectedStatus,
+            std::function<TString(TStringBuf, TStringBuf)> errorResponse)
+    {
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+        auto settings = TS3Mock::TSettings(port);
+        settings.ErrorResponse = std::move(errorResponse);
+        TS3Mock s3Mock(ConvertTestData(MakeSqlGetterTableData(
+            "CREATE TABLE source (key Utf8, value Utf8, PRIMARY KEY (key));")), settings);
+        UNIT_ASSERT_C(s3Mock.Start(), s3Mock.GetError());
+
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+
+        ui64 txId = 100;
+        TestImport(runtime, ++txId, "/MyRoot", Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              number_of_retries: %u
+              items {
+                source_prefix: ""
+                destination_path: "%s"
+              }
+            }
+        )", port, retries, destination.c_str()));
+        env.TestWaitNotification(runtime, txId);
+        TestGetImport(runtime, txId, "/MyRoot", expectedStatus);
+
+        TestDescribeResult(DescribePath(runtime, destination), {
+            expectedStatus == Ydb::StatusIds::SUCCESS ? NLs::PathExist : NLs::PathNotExist,
+        });
+    }
+
+    Y_UNIT_TEST(SqlImportFlagDisabled) {
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+        TS3Mock s3Mock(ConvertTestData(MakeSqlGetterTableData("CREATE TABLE source (key Utf8, PRIMARY KEY (key));")), TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        const auto result = RunTableSchemeGetter(runtime, port, false);
+
+        UNIT_ASSERT_VALUES_EQUAL(result.SqlHeadRequests, 0);
+        UNIT_ASSERT_VALUES_EQUAL(result.SqlGetRequests, 0);
+        UNIT_ASSERT(result.ImportInfo->Items[0].Table);
+        UNIT_ASSERT(result.ImportInfo->Items[0].CreationQuery.empty());
+    }
+
+    Y_UNIT_TEST(SqlImportMissingSql) {
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+        TS3Mock s3Mock(ConvertTestData(MakeSqlGetterTableData()), TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        const auto result = RunTableSchemeGetter(runtime, port, true);
+
+        UNIT_ASSERT_VALUES_EQUAL(result.SqlHeadRequests, 1);
+        UNIT_ASSERT_VALUES_EQUAL(result.SqlGetRequests, 0);
+        UNIT_ASSERT(result.ImportInfo->Items[0].Table);
+        UNIT_ASSERT(result.ImportInfo->Items[0].CreationQuery.empty());
+    }
+
+    Y_UNIT_TEST(SqlImportLoadsBothDescriptors) {
+        static const TString Sql = "CREATE TABLE source (key Utf8, PRIMARY KEY (key));";
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+        TS3Mock s3Mock(ConvertTestData(MakeSqlGetterTableData(Sql)), TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        const auto result = RunTableSchemeGetter(runtime, port, true);
+
+        UNIT_ASSERT_VALUES_EQUAL(result.SqlHeadRequests, 1);
+        UNIT_ASSERT_VALUES_EQUAL(result.SqlGetRequests, 1);
+        UNIT_ASSERT(result.ImportInfo->Items[0].Table);
+        UNIT_ASSERT_VALUES_EQUAL(result.ImportInfo->Items[0].CreationQuery, Sql);
+    }
+
+    Y_UNIT_TEST(SqlImportRejectsBadSqlChecksum) {
+        auto objects = ConvertTestData(MakeSqlGetterTableData(
+            "CREATE TABLE source (key Utf8, value Utf8, PRIMARY KEY (key));"));
+        objects["/create_table.sql.sha256"] = "not-the-sql-checksum";
+        AssertSqlArtifactImport(
+            std::move(objects), "/MyRoot/BadSqlChecksum", Ydb::StatusIds::CANCELLED);
+    }
+
+    Y_UNIT_TEST(SqlImportRejectsMissingRequiredSqlChecksum) {
+        auto objects = ConvertTestData(MakeSqlGetterTableData(
+            "CREATE TABLE source (key Utf8, value Utf8, PRIMARY KEY (key));"));
+        objects.erase("/create_table.sql.sha256");
+        AssertSqlArtifactImport(
+            std::move(objects), "/MyRoot/MissingSqlChecksum", Ydb::StatusIds::CANCELLED);
+    }
+
+    Y_UNIT_TEST(SqlImportEmptySqlFallsBackToProtobuf) {
+        auto objects = ConvertTestData(MakeSqlGetterTableData());
+        objects["/create_table.sql"] = "";
+        objects["/create_table.sql.sha256"] = NBackup::ComputeChecksum("");
+        AssertSqlArtifactImport(
+            std::move(objects), "/MyRoot/EmptySqlFallback", Ydb::StatusIds::SUCCESS);
+    }
+
+    Y_UNIT_TEST(SqlImportCanSkipBadSqlChecksum) {
+        auto objects = ConvertTestData(MakeSqlGetterTableData(
+            "CREATE TABLE source (key Utf8, value Utf8, PRIMARY KEY (key));"));
+        objects["/create_table.sql.sha256"] = "not-the-sql-checksum";
+        AssertSqlArtifactImport(
+            std::move(objects), "/MyRoot/SkippedSqlChecksum", Ydb::StatusIds::SUCCESS, true);
+    }
+
+    Y_UNIT_TEST(SqlImportMetadataVersionZeroDoesNotRequireChecksum) {
+        auto data = GenerateTestData(R"(
+            columns {
+              name: "key"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            columns {
+              name: "value"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            primary_key: "key"
+        )");
+        data.CreationQuery =
+            "CREATE TABLE source (key Utf8, value Utf8, PRIMARY KEY (key));";
+        AssertSqlArtifactImport(
+            ConvertTestData(data), "/MyRoot/SqlMetadataV0", Ydb::StatusIds::SUCCESS);
+    }
+
+    Y_UNIT_TEST(SqlImportRejectsSqlArtifactAccessDenied) {
+        std::atomic<ui32> failures = 0;
+        AssertSqlArtifactStorageBehavior(
+            "/MyRoot/SqlAccessDenied", 3, Ydb::StatusIds::CANCELLED,
+            [&](TStringBuf method, TStringBuf path) -> TString {
+                if (method == "HEAD" && path.EndsWith("/create_table.sql")) {
+                    ++failures;
+                    return MakeS3ErrorResponse(
+                        "403 Forbidden", "AccessDenied", "table SQL access denied");
+                }
+                return {};
+            });
+        UNIT_ASSERT_VALUES_EQUAL(failures.load(), 1);
+    }
+
+    Y_UNIT_TEST(SqlImportRetriesTransientSqlArtifactError) {
+        std::atomic<ui32> failures = 0;
+        AssertSqlArtifactStorageBehavior(
+            "/MyRoot/SqlTransientRetry", 2, Ydb::StatusIds::SUCCESS,
+            [&](TStringBuf method, TStringBuf path) -> TString {
+                if (method == "HEAD" && path.EndsWith("/create_table.sql")
+                    && failures.fetch_add(1) == 0)
+                {
+                    return MakeS3ErrorResponse(
+                        "500 Internal Server Error", "InternalError", "transient table SQL error");
+                }
+                return {};
+            });
+        UNIT_ASSERT(failures.load() >= 1);
+    }
+
+    Y_UNIT_TEST(SqlImportFailsAfterSqlArtifactRetriesExhausted) {
+        std::atomic<ui32> failures = 0;
+        AssertSqlArtifactStorageBehavior(
+            "/MyRoot/SqlRetriesExhausted", 2, Ydb::StatusIds::CANCELLED,
+            [&](TStringBuf method, TStringBuf path) -> TString {
+                if (method == "HEAD" && path.EndsWith("/create_table.sql")) {
+                    ++failures;
+                    return MakeS3ErrorResponse(
+                        "500 Internal Server Error", "InternalError", "persistent table SQL error");
+                }
+                return {};
+            });
+        UNIT_ASSERT(failures.load() >= 3);
+    }
+
+    Y_UNIT_TEST(SqlImportCompilesRowTable) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+
+        const auto prepared = CompileTableSchemeQuerySuccessfully(runtime, R"(
+            CREATE TABLE `/MyRoot/SqlRow` (
+                key Uint64 NOT NULL,
+                value Utf8 DEFAULT 'sql-default',
+                PRIMARY KEY (key)
+            );
+        )");
+
+        UNIT_ASSERT_VALUES_EQUAL(
+            static_cast<int>(prepared.GetOperationType()),
+            static_cast<int>(ESchemeOpCreateTable));
+        UNIT_ASSERT_VALUES_EQUAL(prepared.GetWorkingDir(), "/MyRoot");
+        UNIT_ASSERT_VALUES_EQUAL(prepared.GetCreateTable().GetName(), "SqlRow");
+        UNIT_ASSERT_VALUES_EQUAL(prepared.GetCreateTable().ColumnsSize(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(prepared.GetCreateTable().GetColumns(1).GetName(), "value");
+        UNIT_ASSERT(prepared.GetCreateTable().GetColumns(1).HasDefaultFromLiteral());
+    }
+
+    Y_UNIT_TEST(SqlImportCompilesIndexedTable) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+
+        const auto prepared = CompileTableSchemeQuerySuccessfully(runtime, R"(
+            CREATE TABLE `/MyRoot/SqlIndexed` (
+                key Uint64 NOT NULL,
+                value Utf8,
+                payload String,
+                INDEX idx GLOBAL ON (value) COVER (payload),
+                PRIMARY KEY (key)
+            );
+        )");
+
+        UNIT_ASSERT_VALUES_EQUAL(
+            static_cast<int>(prepared.GetOperationType()),
+            static_cast<int>(ESchemeOpCreateIndexedTable));
+        UNIT_ASSERT_VALUES_EQUAL(prepared.GetWorkingDir(), "/MyRoot");
+        UNIT_ASSERT_VALUES_EQUAL(prepared.GetCreateIndexedTable().GetTableDescription().GetName(), "SqlIndexed");
+        UNIT_ASSERT_VALUES_EQUAL(prepared.GetCreateIndexedTable().IndexDescriptionSize(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(prepared.GetCreateIndexedTable().GetIndexDescription(0).GetName(), "idx");
+        UNIT_ASSERT_VALUES_EQUAL(prepared.GetCreateIndexedTable().GetIndexDescription(0).GetKeyColumnNames(0), "value");
+        UNIT_ASSERT_VALUES_EQUAL(prepared.GetCreateIndexedTable().GetIndexDescription(0).GetDataColumnNames(0), "payload");
+    }
+
+    Y_UNIT_TEST(SqlImportCompilesColumnTable) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+
+        const auto prepared = CompileTableSchemeQuerySuccessfully(runtime, R"(
+            CREATE TABLE `/MyRoot/SqlColumn` (
+                key Uint64 NOT NULL,
+                value Utf8,
+                PRIMARY KEY (key)
+            ) WITH (STORE = COLUMN);
+        )");
+
+        UNIT_ASSERT_VALUES_EQUAL(
+            static_cast<int>(prepared.GetOperationType()),
+            static_cast<int>(ESchemeOpCreateColumnTable));
+        UNIT_ASSERT_VALUES_EQUAL(prepared.GetWorkingDir(), "/MyRoot");
+        UNIT_ASSERT_VALUES_EQUAL(prepared.GetCreateColumnTable().GetName(), "SqlColumn");
+        UNIT_ASSERT_VALUES_EQUAL(prepared.GetCreateColumnTable().GetSchema().ColumnsSize(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(prepared.GetCreateColumnTable().GetSchema().GetKeyColumnNames(0), "key");
+    }
+
+    Y_UNIT_TEST(SqlImportRejectsUnexpectedPreparedOperation) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableViews(true);
+
+        const auto result = CompileTableSchemeQuery(runtime, R"(
+            CREATE VIEW `/MyRoot/NotATable`
+                WITH (security_invoker = TRUE)
+                AS SELECT 1;
+        )");
+
+        UNIT_ASSERT_VALUES_UNEQUAL(result.Status, Ydb::StatusIds::SUCCESS);
+        const auto* error = std::get_if<TString>(&result.Result);
+        UNIT_ASSERT_C(error != nullptr, "rejected operation must return an error");
+        UNIT_ASSERT_STRING_CONTAINS(*error, "table creation");
+    }
+
+    Y_UNIT_TEST(SqlImportUsesSqlDefinitionAndRestoresData) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+
+        auto data = GenerateTestData(R"(
+            columns {
+              name: "key"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            columns {
+              name: "value"
+              type { optional_type { item { type_id: UTF8 } } }
+              from_literal {
+                type { type_id: UTF8 }
+                value { text_value: "protobuf-default" }
+              }
+            }
+            primary_key: "key"
+        )", {{"a", 1}});
+        data.CreationQuery = R"(
+            CREATE TABLE `SourceName` (
+                key Utf8,
+                value Utf8 DEFAULT 'sql-default',
+                PRIMARY KEY (key)
+            );
+        )";
+
+        Run(runtime, env, ConvertTestData(data), R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/NestedRestored"
+              }
+            }
+        )");
+
+        const auto describe = DescribePath(runtime, "/MyRoot/NestedRestored", true, true);
+        UNIT_ASSERT_VALUES_EQUAL(describe.GetStatus(), NKikimrScheme::StatusSuccess);
+        const auto literal = GetUtf8LiteralDefault(describe.GetPathDescription().GetTable(), "value");
+        UNIT_ASSERT_C(literal, "SQL literal default was not retained");
+        UNIT_ASSERT_VALUES_EQUAL(*literal, "sql-default");
+
+        ExecuteDataQuery(runtime, R"(
+            UPSERT INTO `/MyRoot/NestedRestored` (key)
+            VALUES (Utf8("inserted"));
+        )");
+
+        const auto content = ReadTable(
+            runtime, TTestTxConfig::FakeHiveTablets, "NestedRestored", {"key"}, {"key", "value"});
+        NKqp::CompareYson(
+            R"([[[[[["a1"];["value1"]];[["inserted"];["sql-default"]]];%false]]])",
+            content);
+    }
+
+    Y_UNIT_TEST(SqlImportFlagDisabledUsesProtobufDefinition) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(false);
+
+        auto data = GenerateTestData(R"(
+            columns {
+              name: "key"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            columns {
+              name: "value"
+              type { optional_type { item { type_id: UTF8 } } }
+              from_literal {
+                type { type_id: UTF8 }
+                value { text_value: "protobuf-default" }
+              }
+            }
+            primary_key: "key"
+        )", {{"a", 1}});
+        data.CreationQuery = R"(
+            CREATE TABLE `SourceName` (
+                key Utf8,
+                value Utf8 DEFAULT 'sql-default',
+                PRIMARY KEY (key)
+            );
+        )";
+
+        Run(runtime, env, ConvertTestData(data), R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/LegacyRestored"
+              }
+            }
+        )");
+
+        const auto describe = DescribePath(runtime, "/MyRoot/LegacyRestored", true, true);
+        UNIT_ASSERT_VALUES_EQUAL(describe.GetStatus(), NKikimrScheme::StatusSuccess);
+        const auto literal = GetUtf8LiteralDefault(describe.GetPathDescription().GetTable(), "value");
+        UNIT_ASSERT_C(literal, "protobuf literal default was not retained");
+        UNIT_ASSERT_VALUES_EQUAL(*literal, "protobuf-default");
+
+        ExecuteDataQuery(runtime, R"(
+            UPSERT INTO `/MyRoot/LegacyRestored` (key)
+            VALUES (Utf8("inserted"));
+        )");
+
+        const auto content = ReadTable(
+            runtime, TTestTxConfig::FakeHiveTablets, "LegacyRestored", {"key"}, {"key", "value"});
+        NKqp::CompareYson(
+            R"([[[[[["a1"];["value1"]];[["inserted"];["protobuf-default"]]];%false]]])",
+            content);
+    }
+
+    Y_UNIT_TEST(SqlImportFallsBackOnMultipleStatements) {
+        AssertSqlImportFallsBackToProtobuf(R"(
+            CREATE TABLE SourceName (
+                key Utf8,
+                value Utf8 DEFAULT 'sql-default',
+                PRIMARY KEY (key)
+            );
+            SELECT 1;
+        )", "/MyRoot/FallbackMultipleStatements");
+    }
+
+    Y_UNIT_TEST(SqlImportFallsBackOnCompilationFailure) {
+        AssertSqlImportFallsBackToProtobuf(R"(
+            CREATE TABLE SourceName (
+                key Utf8,
+                value ATypeThatDoesNotExist,
+                PRIMARY KEY (key)
+            );
+        )", "/MyRoot/FallbackCompilationFailure");
+    }
+
+    Y_UNIT_TEST(SqlImportFallsBackOnNormalizationMismatch) {
+        AssertSqlImportFallsBackToProtobuf(R"(
+            CREATE TABLE SourceName (
+                key Utf8,
+                value String DEFAULT 'sql-default',
+                PRIMARY KEY (key)
+            );
+        )", "/MyRoot/FallbackNormalizationMismatch");
+    }
+
+    Y_UNIT_TEST(SqlImportInvalidLegacyReportsBothFailures) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+
+        auto data = GenerateTestData(R"(
+            columns {
+              name: "key"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            primary_key: "key"
+            read_replicas_settings {}
+        )");
+        data.CreationQuery = "this is not SQL";
+
+        Run(runtime, env, ConvertTestData(data), R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/InvalidRepresentations"
+              }
+            }
+        )", Ydb::StatusIds::CANCELLED);
+
+        const auto response = TestGetImport(runtime, 101, "/MyRoot", Ydb::StatusIds::CANCELLED);
+        const auto issues = NYql::IssuesFromMessageAsString(response.GetResponse().GetEntry().GetIssues());
+        UNIT_ASSERT_STRING_CONTAINS(issues, "table SQL preparation failed");
+        UNIT_ASSERT_STRING_CONTAINS(issues, "legacy table scheme is invalid");
+    }
+
+    Y_UNIT_TEST(SqlImportRestoresColumnTableData) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableColumnTablesBackup(true);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+
+        ui64 writtenRows = 0;
+        runtime.SetObserverFunc([&writtenRows](TAutoPtr<IEventHandle>& ev) {
+            if (ev->GetTypeRewrite() == TEvDataShard::EvS3UploadRowsResponse) {
+                writtenRows = Max(writtenRows, ev->Get<TEvDataShard::TEvS3UploadRowsResponse>()->Info.WrittenRows);
+            }
+            return TTestActorRuntime::EEventAction::PROCESS;
+        });
+
+        auto data = GenerateTestData(TTypedScheme{
+            EPathTypeColumnTable,
+            R"(
+                columns {
+                  name: "timestamp"
+                  type { type_id: UINT64 }
+                  not_null: true
+                }
+                columns {
+                  name: "value"
+                  type { optional_type { item { type_id: UTF8 } } }
+                }
+                primary_key: "timestamp"
+                partitioning_settings {
+                  min_partitions_count: 1
+                }
+                store_type: STORE_TYPE_COLUMN
+            )"
+        }, {{"", 1}});
+        data.CreationQuery = R"(
+            CREATE TABLE SourceName (
+                timestamp Uint64 NOT NULL,
+                value Utf8,
+                PRIMARY KEY (timestamp)
+            ) WITH (STORE = COLUMN);
+        )";
+
+        Run(runtime, env, ConvertTestData(data), R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/SqlColumnRestored"
+              }
+            }
+        )");
+
+        const auto describe = DescribePrivatePath(runtime, "/MyRoot/SqlColumnRestored", true, true);
+        UNIT_ASSERT_VALUES_EQUAL(describe.GetStatus(), NKikimrScheme::StatusSuccess);
+        UNIT_ASSERT(describe.GetPathDescription().HasColumnTableDescription());
+        UNIT_ASSERT_VALUES_EQUAL(writtenRows, 1);
+    }
+
+    Y_UNIT_TEST(SqlImportPreservesCompanionMetadataAndColumnOrder) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+
+        const TString permissions = R"(
+            actions { change_owner: "eve" }
+            actions {
+              grant {
+                subject: "alice"
+                permission_names: "ydb.generic.read"
+              }
+            }
+        )";
+        auto data = GenerateTestData(R"(
+            columns {
+              name: "value"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            columns {
+              name: "key"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            primary_key: "key"
+            partition_at_keys {
+              split_points {
+                type { tuple_type { elements { optional_type { item { type_id: UTF8 } } } } }
+                value { items { text_value: "b" } }
+              }
+            }
+            attributes { key: "companion" value: "kept" }
+            statistics {
+              name: "value_stats"
+              columns: "value"
+              types: COUNT_MIN_SKETCH
+            }
+        )", {}, permissions);
+        const auto first = GenerateTestData("a", 1);
+        const auto second = GenerateTestData("b", 1);
+        data.Data.emplace_back(TString("\"value1\",\"a1\"\n"), first.YsonStr);
+        data.Data.emplace_back(TString("\"value1\",\"b1\"\n"), second.YsonStr);
+        data.CreationQuery = R"(
+            CREATE TABLE SourceName (
+                key Utf8,
+                value Utf8,
+                PRIMARY KEY (key)
+            );
+        )";
+
+        Run(runtime, env, ConvertTestData(data), R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/SqlMetadataRestored"
+              }
+            }
+        )");
+
+        const auto describe = DescribePath(runtime, "/MyRoot/SqlMetadataRestored", true, true);
+        TestDescribeResult(describe, {
+            NLs::PathExist,
+            NLs::HasOwner("eve"),
+            NLs::HasRight("+R:alice"),
+            NLs::UserAttrsEqual({{"companion", "kept"}}),
+            NLs::CheckMultiColumnStatistics(
+                "value_stats", {"value"},
+                {NKikimrSchemeOp::EMultiColumnStatisticsType::COUNT_MIN_SKETCH}),
+        });
+        UNIT_ASSERT_VALUES_EQUAL(describe.GetPathDescription().GetTable().GetPartitionCount(), 2);
+
+        NKqp::CompareYson(first.YsonStr, ReadTable(
+            runtime, TTestTxConfig::FakeHiveTablets, "SqlMetadataRestored", {"key"}, {"key", "value"}));
+        NKqp::CompareYson(second.YsonStr, ReadTable(
+            runtime, TTestTxConfig::FakeHiveTablets + 1, "SqlMetadataRestored", {"key"}, {"key", "value"}));
+    }
+
+    Y_UNIT_TEST(SqlImportRestoresCompanionSequenceState) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+
+        auto data = GenerateTestData(R"(
+            columns {
+              name: "key"
+              type { type_id: INT64 }
+              not_null: true
+              from_sequence {
+                name: "_serial_column_key"
+                min_value: 1
+                max_value: 1000
+                start_value: 5
+                cache: 2
+                increment: 3
+                cycle: false
+                set_val { next_value: 41 next_used: true }
+                data_type { type_id: INT64 }
+              }
+            }
+            columns {
+              name: "value"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            primary_key: "key"
+        )", {{"", 1}});
+        data.CreationQuery = R"(
+            CREATE TABLE SourceName (
+                key Serial8 NOT NULL,
+                value Utf8,
+                PRIMARY KEY (key)
+            );
+        )";
+
+        Run(runtime, env, ConvertTestData(data), R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/SqlSerialRestored"
+              }
+            }
+        )");
+
+        const auto table = DescribePath(runtime, "/MyRoot/SqlSerialRestored", true, true);
+        bool hasSequenceMapping = false;
+        for (const auto& column : table.GetPathDescription().GetTable().GetColumns()) {
+            if (column.GetName() == "key" &&
+                column.GetDefaultValueCase() == TColumnDescription::kDefaultFromSequence &&
+                column.GetDefaultFromSequence() == "_serial_column_key")
+            {
+                hasSequenceMapping = true;
+                break;
+            }
+        }
+        UNIT_ASSERT_C(hasSequenceMapping, "SQL serial column lost its sequence mapping");
+        TestDescribeResult(DescribePrivatePath(runtime, "/MyRoot/SqlSerialRestored/_serial_column_key"), {
+            NLs::PathExist,
+            NLs::SequenceName("_serial_column_key"),
+            NLs::SequenceIncrement(3),
+            NLs::SequenceMinValue(1),
+            NLs::SequenceMaxValue(1000),
+            NLs::SequenceStartValue(5),
+            NLs::SequenceCache(2),
+        });
+        UNIT_ASSERT_VALUES_EQUAL(DoNextVal(runtime, "/MyRoot/SqlSerialRestored/_serial_column_key"), 44);
+    }
+
+    Y_UNIT_TEST(SqlImportRetainsLocalIndexAtCreation) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+        runtime.GetAppData().FeatureFlags.SetEnableLocalBloomFilterIndex(true);
+        runtime.GetAppData().FeatureFlags.SetEnableLocalIndexAsSchemeObject(true);
+
+        auto data = GenerateTestData(R"(
+            columns {
+              name: "key"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            columns {
+              name: "value"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            primary_key: "key"
+            indexes {
+              name: "by_key"
+              index_columns: "key"
+              local_bloom_filter_index {
+                false_positive_probability: 0.03
+              }
+            }
+        )", {{"a", 1}});
+        data.CreationQuery = R"(
+            CREATE TABLE SourceName (
+                key Utf8,
+                value Utf8,
+                INDEX by_key LOCAL USING bloom_filter ON (key)
+                    WITH (false_positive_probability = 0.03),
+                PRIMARY KEY (key)
+            );
+        )";
+
+        Run(runtime, env, ConvertTestData(data), R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              index_population_mode: INDEX_POPULATION_MODE_BUILD
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/SqlLocalIndexRestored"
+              }
+            }
+        )");
+
+        NLocalIndexes::CheckRowTableBloomSchemeObjects(
+            runtime,
+            "/MyRoot/SqlLocalIndexRestored",
+            {1},
+            {{"by_key", {"key"}}});
+        NKqp::CompareYson(data.Data[0].YsonStr, ReadTable(
+            runtime, TTestTxConfig::FakeHiveTablets,
+            "SqlLocalIndexRestored", {"key"}, {"key", "value"}));
+    }
+
+    Y_UNIT_TEST(SqlImportCoexistsWithViewImport) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+        runtime.GetAppData().FeatureFlags.SetEnableViews(true);
+
+        auto table = GenerateTestData(R"(
+            columns {
+              name: "key"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            columns {
+              name: "value"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            primary_key: "key"
+        )", {{"a", 1}});
+        table.CreationQuery = R"(
+            CREATE TABLE SourceTable (
+                key Utf8,
+                value Utf8,
+                PRIMARY KEY (key)
+            );
+        )";
+        auto view = GenerateTestData(TTypedScheme{
+            EPathTypeView,
+            R"(
+                -- backup root: "/MyRoot"
+                CREATE VIEW IF NOT EXISTS `SourceView`
+                    WITH security_invoker = TRUE AS SELECT 1;
+            )"
+        });
+
+        Run(runtime, env, ConvertTestData({
+            {"/table", table},
+            {"/view", view},
+        }), R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: "table"
+                destination_path: "/MyRoot/SqlMixedTable"
+              }
+              items {
+                source_prefix: "view"
+                destination_path: "/MyRoot/SqlMixedView"
+              }
+            }
+        )");
+
+        TestDescribeResult(DescribePath(runtime, "/MyRoot/SqlMixedTable"), {
+            NLs::Finished,
+            NLs::IsTable,
+        });
+        TestDescribeResult(DescribePath(runtime, "/MyRoot/SqlMixedView"), {
+            NLs::Finished,
+            NLs::IsView,
+        });
+        NKqp::CompareYson(table.Data[0].YsonStr, ReadTable(
+            runtime, TTestTxConfig::FakeHiveTablets,
+            "SqlMixedTable", {"key"}, {"key", "value"}));
+    }
+
+    void AssertSqlImportUsesCapturedFlag(bool enabledAtCreation) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(enabledAtCreation);
+
+        auto data = MakeSqlGetterTableData(R"(
+            CREATE TABLE SourceName (
+                key Utf8,
+                value Utf8 DEFAULT 'sql-default',
+                PRIMARY KEY (key)
+            );
+        )");
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+        TS3Mock s3Mock(ConvertTestData(data), TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        THolder<IEventHandle> delayed;
+        auto previousObserver = SetDelayObserver(runtime, delayed, [](TAutoPtr<IEventHandle>& ev) {
+            return ev->GetTypeRewrite() == TEvPrivate::EvImportSchemeReady;
+        });
+
+        const ui64 importId = 101;
+        TestImport(runtime, importId, "/MyRoot", Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/CapturedFlagTable"
+              }
+            }
+        )", port));
+        WaitForDelayed(runtime, delayed, previousObserver);
+
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(!enabledAtCreation);
+        runtime.Send(delayed.Release(), 0, true);
+        env.TestWaitNotification(runtime, importId);
+        TestGetImport(runtime, importId, "/MyRoot", Ydb::StatusIds::SUCCESS);
+
+        const auto describe = DescribePath(runtime, "/MyRoot/CapturedFlagTable", true, true);
+        const auto literal = GetUtf8LiteralDefault(describe.GetPathDescription().GetTable(), "value");
+        UNIT_ASSERT_C(literal, "restored table lost its literal default");
+        UNIT_ASSERT_VALUES_EQUAL(
+            *literal, enabledAtCreation ? "sql-default" : "protobuf-default");
+    }
+
+    Y_UNIT_TEST(SqlImportCapturedEnabledFlagSurvivesFlip) {
+        AssertSqlImportUsesCapturedFlag(true);
+    }
+
+    Y_UNIT_TEST(SqlImportCapturedDisabledFlagSurvivesFlip) {
+        AssertSqlImportUsesCapturedFlag(false);
+    }
+
+    Y_UNIT_TEST(SqlImportIgnoresLateCompilerReplyAfterCancellation) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+
+        auto data = MakeSqlGetterTableData(R"(
+            CREATE TABLE SourceName (
+                key Utf8,
+                value Utf8 DEFAULT 'sql-default',
+                PRIMARY KEY (key)
+            );
+        )");
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+        TS3Mock s3Mock(ConvertTestData(data), TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        THolder<IEventHandle> delayed;
+        auto previousObserver = SetDelayObserver(runtime, delayed, [](TAutoPtr<IEventHandle>& ev) {
+            return ev->GetTypeRewrite() == TEvPrivate::EvImportSchemeQueryResult;
+        });
+
+        ui64 txId = 100;
+        const ui64 importId = ++txId;
+        TestImport(runtime, importId, "/MyRoot", Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: ""
+                destination_path: "/MyRoot/CancelledSqlTable"
+              }
+            }
+        )", port));
+        WaitForDelayed(runtime, delayed, previousObserver);
+
+        TestCancelImport(runtime, ++txId, "/MyRoot", importId);
+        env.TestWaitNotification(runtime, importId);
+        TestGetImport(runtime, importId, "/MyRoot", Ydb::StatusIds::CANCELLED);
+
+        runtime.Send(delayed.Release(), 0, true);
+        runtime.DispatchEvents(TDispatchOptions(), TDuration::Seconds(1));
+
+        TestGetImport(runtime, importId, "/MyRoot", Ydb::StatusIds::CANCELLED);
+        TestDescribeResult(DescribePath(runtime, "/MyRoot/CancelledSqlTable"), {
+            NLs::PathNotExist,
+        });
+    }
+
+    Y_UNIT_TEST(SqlImportCurrentExportRowTableRoundTrip) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true)
+            .EnableChecksumsExport(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+
+        ui64 txId = 100;
+        TestCreateTable(runtime, ++txId, "/MyRoot", R"(
+            Name: "SqlCurrentOriginal"
+            Columns { Name: "key" Type: "Uint32" }
+            Columns {
+                Name: "value"
+                Type: "Utf8"
+                DefaultFromLiteral {
+                    type { optional_type { item { type_id: UTF8 } } }
+                    value { items { text_value: "current-export-default" } }
+                }
+            }
+            KeyColumnNames: ["key"]
+        )");
+        env.TestWaitNotification(runtime, txId);
+        UpdateRow(runtime, "SqlCurrentOriginal", 1, "valueA", TTestTxConfig::FakeHiveTablets);
+
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+        TS3Mock s3Mock({}, TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        TestExport(runtime, ++txId, "/MyRoot", Sprintf(R"(
+            ExportToS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_path: "/MyRoot/SqlCurrentOriginal"
+                destination_prefix: "SqlCurrentRow"
+              }
+            }
+        )", port));
+        env.TestWaitNotification(runtime, txId);
+        TestGetExport(runtime, txId, "/MyRoot");
+        UNIT_ASSERT_C(s3Mock.GetData().contains("/SqlCurrentRow/create_table.sql"),
+            "current export did not produce create_table.sql");
+        UNIT_ASSERT_C(s3Mock.GetData().contains("/SqlCurrentRow/create_table.sql.sha256"),
+            "current export did not produce the SQL checksum");
+
+        bool compilerSucceeded = false;
+        bool proposedPreparedSql = false;
+        const auto previousObserver = runtime.SetObserverFunc([&](TAutoPtr<IEventHandle>& ev) {
+            if (ev->GetTypeRewrite() == TEvPrivate::EvImportSchemeQueryResult) {
+                const auto* result = ev->Get<TEvPrivate::TEvImportSchemeQueryResult>();
+                compilerSucceeded = compilerSucceeded
+                    || result->Status == Ydb::StatusIds::SUCCESS;
+            } else if (ev->GetTypeRewrite() == TEvSchemeShard::EvModifySchemeTransaction) {
+                const auto& record = ev->Get<TEvSchemeShard::TEvModifySchemeTransaction>()->Record;
+                if (record.TransactionSize() == 1) {
+                    const auto& modify = record.GetTransaction(0);
+                    if (modify.GetOperationType() == ESchemeOpCreateIndexedTable
+                        && modify.GetCreateIndexedTable().GetTableDescription().GetName() == "SqlCurrentRestored")
+                    {
+                        proposedPreparedSql = modify.GetFailedOnAlreadyExists();
+                    }
+                }
+            }
+            return TTestActorRuntime::EEventAction::PROCESS;
+        });
+
+        TestImport(runtime, ++txId, "/MyRoot", Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: "SqlCurrentRow"
+                destination_path: "/MyRoot/SqlCurrentRestored"
+              }
+            }
+        )", port));
+        env.TestWaitNotification(runtime, txId);
+        TestGetImport(runtime, txId, "/MyRoot");
+        runtime.SetObserverFunc(previousObserver);
+
+        UNIT_ASSERT_C(compilerSucceeded, "current-export SQL was not compiled");
+        UNIT_ASSERT_C(proposedPreparedSql, "current-export SQL operation was not proposed");
+        const auto describe = DescribePath(runtime, "/MyRoot/SqlCurrentRestored", true, true);
+        const auto literal = GetUtf8LiteralDefault(describe.GetPathDescription().GetTable(), "value");
+        UNIT_ASSERT_C(literal, "current-export SQL default was not restored");
+        UNIT_ASSERT_VALUES_EQUAL(*literal, "current-export-default");
+        UNIT_ASSERT_VALUES_EQUAL(CountRows(runtime, "/MyRoot/SqlCurrentRestored"), 1);
+    }
+
+    Y_UNIT_TEST(SqlImportCurrentExportColumnTableRoundTrip) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true)
+            .EnableChecksumsExport(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableColumnTablesBackup(true);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+
+        ui64 txId = 100;
+        TestCreateColumnTable(runtime, ++txId, "/MyRoot", R"(
+            Name: "SqlCurrentColumnOriginal"
+            ColumnShardCount: 1
+            Schema {
+                Columns { Name: "timestamp" Type: "Uint64" NotNull: true }
+                Columns { Name: "value" Type: "Utf8" }
+                KeyColumnNames: "timestamp"
+            }
+        )");
+        env.TestWaitNotification(runtime, txId);
+        ExecuteDataQuery(runtime, R"(
+            UPSERT INTO `/MyRoot/SqlCurrentColumnOriginal` (timestamp, value)
+            VALUES (1, Utf8("valueA"));
+        )", NKikimrKqp::QUERY_TYPE_SQL_GENERIC_QUERY);
+
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+        TS3Mock s3Mock({}, TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        TestExport(runtime, ++txId, "/MyRoot", Sprintf(R"(
+            ExportToS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_path: "/MyRoot/SqlCurrentColumnOriginal"
+                destination_prefix: "SqlCurrentColumn"
+              }
+            }
+        )", port));
+        env.TestWaitNotification(runtime, txId);
+        TestGetExport(runtime, txId, "/MyRoot");
+        UNIT_ASSERT_C(s3Mock.GetData().contains("/SqlCurrentColumn/create_table.sql"),
+            "current column-table export did not produce create_table.sql");
+
+        bool compilerSucceeded = false;
+        bool proposedPreparedSql = false;
+        ui64 writtenRows = 0;
+        const auto previousObserver = runtime.SetObserverFunc([&](TAutoPtr<IEventHandle>& ev) {
+            if (ev->GetTypeRewrite() == TEvPrivate::EvImportSchemeQueryResult) {
+                const auto* result = ev->Get<TEvPrivate::TEvImportSchemeQueryResult>();
+                compilerSucceeded = compilerSucceeded
+                    || result->Status == Ydb::StatusIds::SUCCESS;
+            } else if (ev->GetTypeRewrite() == TEvSchemeShard::EvModifySchemeTransaction) {
+                const auto& record = ev->Get<TEvSchemeShard::TEvModifySchemeTransaction>()->Record;
+                if (record.TransactionSize() == 1) {
+                    const auto& modify = record.GetTransaction(0);
+                    if (modify.GetOperationType() == ESchemeOpCreateColumnTable
+                        && modify.GetCreateColumnTable().GetName() == "SqlCurrentColumnRestored")
+                    {
+                        proposedPreparedSql = modify.GetFailedOnAlreadyExists();
+                    }
+                }
+            } else if (ev->GetTypeRewrite() == TEvDataShard::EvS3UploadRowsResponse) {
+                writtenRows = Max(
+                    writtenRows,
+                    ev->Get<TEvDataShard::TEvS3UploadRowsResponse>()->Info.WrittenRows);
+            }
+            return TTestActorRuntime::EEventAction::PROCESS;
+        });
+
+        TestImport(runtime, ++txId, "/MyRoot", Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: "SqlCurrentColumn"
+                destination_path: "/MyRoot/SqlCurrentColumnRestored"
+              }
+            }
+        )", port));
+        env.TestWaitNotification(runtime, txId);
+        TestGetImport(runtime, txId, "/MyRoot");
+        runtime.SetObserverFunc(previousObserver);
+
+        UNIT_ASSERT_C(compilerSucceeded, "current-export column-table SQL was not compiled");
+        UNIT_ASSERT_C(proposedPreparedSql, "current-export column-table SQL operation was not proposed");
+        const auto describe = DescribePrivatePath(
+            runtime, "/MyRoot/SqlCurrentColumnRestored", true, true);
+        UNIT_ASSERT_VALUES_EQUAL(describe.GetStatus(), NKikimrScheme::StatusSuccess);
+        UNIT_ASSERT(describe.GetPathDescription().HasColumnTableDescription());
+        UNIT_ASSERT_VALUES_EQUAL(writtenRows, 1);
+    }
+
+    Y_UNIT_TEST(SqlImportCurrentExportComplexScriptFallsBackWholeItem) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true)
+            .SetupKqpProxy(true)
+            .EnableChecksumsExport(true);
+        TTestEnv env(runtime, options);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+        runtime.GetAppData().FeatureFlags.SetEnableChangefeedsExport(true);
+        runtime.GetAppData().FeatureFlags.SetEnableChangefeedsImport(true);
+
+        ui64 txId = 100;
+        TestCreateIndexedTable(runtime, ++txId, "/MyRoot", R"(
+            TableDescription {
+                Name: "SqlComplexOriginal"
+                Columns { Name: "key" Type: "Uint64" DefaultFromSequence: "seq" }
+                Columns { Name: "value" Type: "Utf8" }
+                KeyColumnNames: ["key"]
+            }
+            SequenceDescription {
+                Name: "seq"
+                StartValue: 2
+                Increment: 3
+                SetVal { NextValue: 100 NextUsed: false }
+            }
+        )");
+        env.TestWaitNotification(runtime, txId);
+        ExecuteDataQuery(runtime, R"(
+            UPSERT INTO `/MyRoot/SqlComplexOriginal` (key, value)
+            VALUES (CAST(1 AS Uint64), Utf8("valueA"));
+        )");
+
+        TestCreateCdcStream(runtime, ++txId, "/MyRoot", R"(
+            TableName: "SqlComplexOriginal"
+            StreamDescription {
+                Name: "feed"
+                Mode: ECdcStreamModeUpdate
+                Format: ECdcStreamFormatJson
+                State: ECdcStreamStateReady
+            }
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+        TS3Mock s3Mock({}, TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        TestExport(runtime, ++txId, "/MyRoot", Sprintf(R"(
+            ExportToS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_path: "/MyRoot/SqlComplexOriginal"
+                destination_prefix: "SqlComplex"
+              }
+            }
+        )", port));
+        env.TestWaitNotification(runtime, txId);
+        TestGetExport(runtime, txId, "/MyRoot");
+
+        const auto& sql = s3Mock.GetData().at("/SqlComplex/create_table.sql");
+        UNIT_ASSERT_C(sql.Contains("ALTER SEQUENCE"), sql);
+        UNIT_ASSERT_C(sql.Contains("ADD CHANGEFEED"), sql);
+
+        ui32 compilerReplies = 0;
+        const auto previousObserver = runtime.SetObserverFunc([&](TAutoPtr<IEventHandle>& ev) {
+            if (ev->GetTypeRewrite() == TEvPrivate::EvImportSchemeQueryResult) {
+                ++compilerReplies;
+            }
+            return TTestActorRuntime::EEventAction::PROCESS;
+        });
+
+        TestImport(runtime, ++txId, "/MyRoot", Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: "SqlComplex"
+                destination_path: "/MyRoot/SqlComplexRestored"
+              }
+            }
+        )", port));
+        env.TestWaitNotification(runtime, txId);
+        TestGetImport(runtime, txId, "/MyRoot");
+        runtime.SetObserverFunc(previousObserver);
+
+        UNIT_ASSERT_VALUES_EQUAL_C(compilerReplies, 0,
+            "a multi-statement table script must fall back before SQL compilation");
+        UNIT_ASSERT_VALUES_EQUAL(CountRows(runtime, "/MyRoot/SqlComplexRestored"), 1);
+        TestDescribeResult(
+            DescribePrivatePath(runtime, "/MyRoot/SqlComplexRestored/seq"), {
+                NLs::PathExist,
+                NLs::SequenceName("seq"),
+                NLs::SequenceIncrement(3),
+                NLs::SequenceStartValue(2),
+            });
+        TestDescribeResult(
+            DescribePath(runtime, "/MyRoot/SqlComplexRestored/feed", false, false, true), {
+                NLs::PathExist,
+            });
+    }
+
     void Run(TTestBasicRuntime& runtime, TTestEnv& env,
             THashMap<TString, TString>&& data, const TString& request,
-            Ydb::StatusIds::StatusCode expectedStatus = Ydb::StatusIds::SUCCESS,
-            const TString& dbName = "/MyRoot", bool serverless = false, const TString& userSID = "", const TString& peerName = "")
+            Ydb::StatusIds::StatusCode expectedStatus,
+            const TString& dbName, bool serverless, const TString& userSID, const TString& peerName)
     {
         ui64 id = 100;
 
@@ -7589,13 +9089,19 @@ Y_UNIT_TEST_SUITE(TImportTests) {
     void MaterializedIndex(
             Ydb::Import::ImportFromS3Settings::IndexPopulationMode mode,
             bool enableDataShardDirectPartImport,
-            const TString& metadata = R"({"version": 1})")
+            const TString& metadata = R"({"version": 1})",
+            bool sqlImport = false)
     {
         TTestBasicRuntime runtime;
-        TTestEnv env(runtime, TTestEnvOptions().EnableIndexMaterialization(true));
+        auto options = TTestEnvOptions().EnableIndexMaterialization(true);
+        if (sqlImport) {
+            options.RunFakeConfigDispatcher(true).SetupKqpProxy(true);
+        }
+        TTestEnv env(runtime, options);
         runtime.GetAppData().FeatureFlags.SetEnableDataShardDirectPartImport(enableDataShardDirectPartImport);
+        runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(sqlImport);
 
-        const auto a = GenerateTestData(R"(
+        auto a = GenerateTestData(R"(
             columns {
               name: "key"
               type { optional_type { item { type_id: UTF8 } } }
@@ -7611,6 +9117,16 @@ Y_UNIT_TEST_SUITE(TImportTests) {
               global_index {}
             }
         )", {{"a", 1}}, "", metadata);
+        if (sqlImport) {
+            a.CreationQuery = R"(
+                CREATE TABLE SourceName (
+                    key Utf8,
+                    value Utf8,
+                    INDEX by_value GLOBAL ON (value),
+                    PRIMARY KEY (key)
+                );
+            )";
+        }
 
         const auto b = GenerateTestData(R"(
             columns {
@@ -7657,6 +9173,24 @@ Y_UNIT_TEST_SUITE(TImportTests) {
 
     Y_UNIT_TEST_FLAG(MaterializedIndexOldMetadata, EnableDataShardDirectPartImport) {
         MaterializedIndex(Ydb::Import::ImportFromS3Settings::INDEX_POPULATION_MODE_IMPORT, EnableDataShardDirectPartImport, R"({"version": 0})");
+    }
+
+    Y_UNIT_TEST_FLAG(SqlImportMaterializedIndexBuild, EnableDataShardDirectPartImport) {
+        MaterializedIndex(
+            Ydb::Import::ImportFromS3Settings::INDEX_POPULATION_MODE_BUILD,
+            EnableDataShardDirectPartImport, R"({"version": 1})", true);
+    }
+
+    Y_UNIT_TEST_FLAG(SqlImportMaterializedIndexImport, EnableDataShardDirectPartImport) {
+        MaterializedIndex(
+            Ydb::Import::ImportFromS3Settings::INDEX_POPULATION_MODE_IMPORT,
+            EnableDataShardDirectPartImport, R"({"version": 1})", true);
+    }
+
+    Y_UNIT_TEST_FLAG(SqlImportMaterializedIndexAuto, EnableDataShardDirectPartImport) {
+        MaterializedIndex(
+            Ydb::Import::ImportFromS3Settings::INDEX_POPULATION_MODE_AUTO,
+            EnableDataShardDirectPartImport, R"({"version": 1})", true);
     }
 
     void MaterializedIndexAbsent(Ydb::Import::ImportFromS3Settings::IndexPopulationMode mode, bool shouldFail, bool enableDataShardDirectPartImport) {
@@ -9208,6 +10742,84 @@ Y_UNIT_TEST_SUITE(TImportWithRebootsTests) {
     template <bool IsFs>
     void ShouldSucceed(TTestWithReboots& t, const TTypedScheme& scheme, bool enableDataShardDirectPartImport) {
         ShouldSucceed<IsFs>(t, {{"", scheme}}, enableDataShardDirectPartImport);
+    }
+
+    template <bool IsFs>
+    void SqlImportWithReboots(TTestWithReboots& t, bool forceFallback) {
+        auto data = GenerateTestData(R"(
+            columns {
+              name: "key"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            columns {
+              name: "value"
+              type { optional_type { item { type_id: UTF8 } } }
+              from_literal {
+                type { type_id: UTF8 }
+                value { text_value: "protobuf-default" }
+              }
+            }
+            primary_key: "key"
+        )", {{"a", 1}});
+        data.CreationQuery = forceFallback ? R"(
+            CREATE TABLE SourceName (
+                key Utf8,
+                value Utf8 DEFAULT 'sql-default',
+                PRIMARY KEY (key)
+            );
+            SELECT 1;
+        )" : R"(
+            CREATE TABLE SourceName (
+                key Utf8,
+                value Utf8 DEFAULT 'sql-default',
+                PRIMARY KEY (key)
+            );
+        )";
+
+        TImportEnv<IsFs> env(ConvertTestData(data), {{"", "/MyRoot/SqlRebootTable"}});
+        t.GetTestEnvOptions().SetupKqpProxy(true);
+        t.Run([&](TTestActorRuntime& runtime, bool& activeZone) {
+            {
+                TInactiveZone inactive(activeZone);
+                env.SetupRuntime(runtime);
+                runtime.GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+                runtime.SetLogPriority(NKikimrServices::IMPORT, NActors::NLog::PRI_TRACE);
+            }
+
+            const ui64 importId = ++t.TxId;
+            AsyncImport(runtime, importId, "/MyRoot", env.Request);
+            t.TestEnv->TestWaitNotification(runtime, importId);
+
+            {
+                TInactiveZone inactive(activeZone);
+                const auto response = TestGetImport(runtime, importId, "/MyRoot", {
+                    Ydb::StatusIds::SUCCESS,
+                    Ydb::StatusIds::NOT_FOUND,
+                });
+                if (response.GetResponse().GetEntry().GetStatus() == Ydb::StatusIds::NOT_FOUND) {
+                    return;
+                }
+
+                const auto describe = DescribePath(runtime, "/MyRoot/SqlRebootTable", true, true);
+                UNIT_ASSERT_VALUES_EQUAL(describe.GetStatus(), NKikimrScheme::StatusSuccess);
+                const auto literal = GetUtf8LiteralDefault(
+                    describe.GetPathDescription().GetTable(), "value");
+                UNIT_ASSERT_C(literal, "restored table lost its literal default");
+                UNIT_ASSERT_VALUES_EQUAL(
+                    *literal, forceFallback ? "protobuf-default" : "sql-default");
+                NKqp::CompareYson(data.Data[0].YsonStr, ReadTable(
+                    runtime, TTestTxConfig::FakeHiveTablets,
+                    "SqlRebootTable", {"key"}, {"key", "value"}));
+            }
+        });
+    }
+
+    Y_UNIT_TEST_WITH_REBOOTS_BUCKETS_TWIN(SqlImportSurvivesReboots, 2, 1, false, IsFs) {
+        SqlImportWithReboots<IsFs>(t, false);
+    }
+
+    Y_UNIT_TEST_WITH_REBOOTS_BUCKETS_TWIN(SqlImportFallbackSurvivesReboots, 2, 1, false, IsFs) {
+        SqlImportWithReboots<IsFs>(t, true);
     }
 
     Y_UNIT_TEST_WITH_REBOOTS_BUCKETS_QUAD(ShouldSucceedOnSimpleTable, 2, 1, false, IsFs, EnableDataShardDirectPartImport) {

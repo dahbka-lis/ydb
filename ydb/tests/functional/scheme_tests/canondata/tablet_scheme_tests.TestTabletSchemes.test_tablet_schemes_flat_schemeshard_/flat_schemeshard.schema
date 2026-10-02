@@ -6564,6 +6564,11 @@
                 "ColumnId": 14,
                 "ColumnName": "SanitizedToken",
                 "ColumnType": "Utf8"
+            },
+            {
+                "ColumnId": 15,
+                "ColumnName": "EnableTableBackupAsSql",
+                "ColumnType": "Bool"
             }
         ],
         "ColumnsDropped": [],
@@ -6583,7 +6588,8 @@
                     11,
                     12,
                     13,
-                    14
+                    14,
+                    15
                 ],
                 "RoomID": 0,
                 "Codec": 0,

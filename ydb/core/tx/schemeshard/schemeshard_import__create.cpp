@@ -5,6 +5,7 @@
 #include "schemeshard_import_getters.h"
 #include "schemeshard_import_helpers.h"
 #include "schemeshard_import_scheme_query_executor.h"
+#include "schemeshard_import_table_sql.h"
 #include "schemeshard_xxport__helpers.h"
 #include "schemeshard_xxport__tx_base.h"
 
@@ -88,9 +89,16 @@ bool AllDoneOrWaiting(const THashMap<EState, int>& stateCounts) {
     });
 }
 
-// the item is to be created by query, i.e. it is not a table
 bool IsCreatedByQuery(const TItem& item) {
     return !item.CreationQuery.empty();
+}
+
+bool IsTableCreatedByQuery(const TItem& item) {
+    return item.Table && IsCreatedByQuery(item);
+}
+
+bool IsNonTableCreatedByQuery(const TItem& item) {
+    return !item.Table && IsCreatedByQuery(item);
 }
 
 bool IsCreateViewQuery(const TString& query) {
@@ -363,6 +371,7 @@ struct TSchemeShard::TImport::TTxCreate: public TSchemeShard::TXxport::TTxBase {
 
         Y_ABORT_UNLESS(importInfo != nullptr);
 
+        importInfo->EnableTableBackupAsSql = AppData()->FeatureFlags.GetEnableTableBackupAsSql();
         importInfo->SanitizedToken = request.GetSanitizedToken();
 
         NIceDb::TNiceDb db(txc.DB);
@@ -818,7 +827,8 @@ private:
                 AllocateTxId(importInfo, itemIdx);
             } else {
                 item.SchemeQueryExecutor = ctx.Register(CreateSchemeQueryExecutor(
-                    Self->SelfId(), importInfo.Id, itemIdx, item.CreationQuery, database
+                    Self->SelfId(), importInfo.Id, itemIdx, item.CreationQuery, database,
+                    item.Table ? EImportSchemeQueryKind::Table : EImportSchemeQueryKind::Other
                 ));
                 Self->RunningImportSchemeQueryExecutors.emplace(item.SchemeQueryExecutor);
             }
@@ -1137,6 +1147,56 @@ private:
         SendNotificationsIfFinished(importInfo);
     }
 
+    bool FallbackToLegacyTableCreation(
+        NIceDb::TNiceDb& db,
+        TImportInfo::TPtr importInfo,
+        ui32 itemIdx,
+        TStringBuf preparationReason)
+    {
+        Y_ABORT_UNLESS(itemIdx < importInfo->Items.size());
+        auto& item = importInfo->Items[itemIdx];
+        Y_ABORT_UNLESS(item.Table);
+
+        if (importInfo->State != EState::Waiting
+            || !IsIn({EState::GetScheme, EState::CreateSchemeObject}, item.State)
+            || item.PreparedCreationQuery
+            || item.WaitTxId != InvalidTxId)
+        {
+            YDB_LOG_WARN("TImport::TTxProgress: ignore table SQL fallback after creation started",
+                {"id", importInfo->Id},
+                {"itemIdx", itemIdx},
+                {"destination", item.DstPathName},
+                {"reason", preparationReason},
+            );
+            return false;
+        }
+
+        TString legacyError;
+        if (!CreateTablePropose(Self, TTxId(), *importInfo, itemIdx, legacyError)) {
+            const TString combinedError = TStringBuilder()
+                << "table SQL preparation failed: " << preparationReason
+                << "; legacy table scheme is invalid: " << legacyError;
+            CancelAndPersist(
+                db, importInfo, itemIdx, combinedError,
+                "both SQL and legacy table creation failed");
+            return false;
+        }
+
+        item.CreationQuery.clear();
+        item.PreparedCreationQuery = Nothing();
+        Self->PersistImportItemCreationQuery(db, *importInfo, itemIdx);
+        Self->PersistImportItemPreparedCreationQuery(db, *importInfo, itemIdx);
+
+        YDB_LOG_WARN("TImport::TTxProgress: falling back to legacy table creation",
+            {"id", importInfo->Id},
+            {"itemIdx", itemIdx},
+            {"destination", item.DstPathName},
+            {"source", importInfo->GetItemSrcPrefix(itemIdx)},
+            {"reason", preparationReason},
+        );
+        return true;
+    }
+
     TMaybe<TString> GetIssues(const TImportInfo::TItem& item, TTxId restoreTxId) {
         if (item.Table->store_type() == Ydb::Table::STORE_TYPE_COLUMN) {
             Y_ABORT_UNLESS(Self->ColumnTables.contains(item.DstPathId));
@@ -1254,19 +1314,27 @@ private:
                     break;
 
                 case EState::CreateSchemeObject:
+                    if (item.WaitTxId == InvalidTxId) {
+                        if (IsCreatedByQuery(item) && !item.PreparedCreationQuery) {
+                            const auto database = GetDatabase(*Self);
+                            item.SchemeQueryExecutor = ctx.Register(CreateSchemeQueryExecutor(
+                                Self->SelfId(), importInfo->Id, itemIdx, item.CreationQuery, database,
+                                item.Table ? EImportSchemeQueryKind::Table : EImportSchemeQueryKind::Other
+                            ));
+                            Self->RunningImportSchemeQueryExecutors.emplace(item.SchemeQueryExecutor);
+                        } else {
+                            AllocateTxId(*importInfo, itemIdx);
+                        }
+                    } else {
+                        SubscribeTx(*importInfo, itemIdx);
+                    }
+                    break;
+
                 case EState::Transferring:
                 case EState::BuildIndexes:
                 case EState::CreateChangefeed:
                     if (item.WaitTxId == InvalidTxId) {
-                        if (!IsCreatedByQuery(item) || item.PreparedCreationQuery) {
-                            AllocateTxId(*importInfo, itemIdx);
-                        } else {
-                            const auto database = GetDatabase(*Self);
-                            item.SchemeQueryExecutor = ctx.Register(CreateSchemeQueryExecutor(
-                                Self->SelfId(), importInfo->Id, itemIdx, item.CreationQuery, database
-                            ));
-                            Self->RunningImportSchemeQueryExecutors.emplace(item.SchemeQueryExecutor);
-                        }
+                        AllocateTxId(*importInfo, itemIdx);
                     } else {
                         SubscribeTx(*importInfo, itemIdx);
                     }
@@ -1335,6 +1403,7 @@ private:
         );
 
         if (!Self->Imports.contains(msg.ImportId)) {
+            Self->RunningImportSchemeGetters.erase(SchemeResult->Sender);
             YDB_LOG_ERROR("TImport::TTxProgress: OnSchemeResult received unknown id",
                 {"id", msg.ImportId},
             );
@@ -1343,6 +1412,7 @@ private:
 
         TImportInfo::TPtr importInfo = Self->Imports.at(msg.ImportId);
         if (msg.ItemIdx >= importInfo->Items.size()) {
+            Self->RunningImportSchemeGetters.erase(SchemeResult->Sender);
             YDB_LOG_ERROR("TImport::TTxProgress: OnSchemeResult received unknown item",
                 {"id", msg.ImportId},
                 {"item", msg.ItemIdx},
@@ -1350,16 +1420,45 @@ private:
             return;
         }
 
-        NIceDb::TNiceDb db(txc.DB);
-
         auto& item = importInfo->Items.at(msg.ItemIdx);
+        if (importInfo->State != EState::Waiting
+            || item.State != EState::GetScheme
+            || !item.SchemeGetter
+            || item.SchemeGetter != SchemeResult->Sender)
+        {
+            Self->RunningImportSchemeGetters.erase(SchemeResult->Sender);
+            YDB_LOG_WARN("TImport::TTxProgress: ignore stale scheme getter result",
+                {"id", msg.ImportId},
+                {"itemIdx", msg.ItemIdx},
+                {"sender", SchemeResult->Sender},
+            );
+            return;
+        }
+
+        NIceDb::TNiceDb db(txc.DB);
         Self->RunningImportSchemeGetters.erase(std::exchange(item.SchemeGetter, {}));
 
         if (!msg.Success) {
             return CancelAndPersist(db, importInfo, msg.ItemIdx, msg.Error, "cannot get scheme");
         }
 
-        if (IsCreatedByQuery(item)) {
+        if (IsTableCreatedByQuery(item)) {
+            const auto database = GetDatabase(*Self);
+            TString creationQuery;
+            TString error;
+            if (!PrepareTableCreationQuery(item.CreationQuery, item.DstPathName, creationQuery, error)) {
+                if (!FallbackToLegacyTableCreation(db, importInfo, msg.ItemIdx, error)) {
+                    return;
+                }
+            } else {
+                item.CreationQuery = std::move(creationQuery);
+                item.SchemeQueryExecutor = ctx.Register(CreateSchemeQueryExecutor(
+                    Self->SelfId(), msg.ImportId, msg.ItemIdx, item.CreationQuery, database,
+                    EImportSchemeQueryKind::Table
+                ));
+                Self->RunningImportSchemeQueryExecutors.emplace(item.SchemeQueryExecutor);
+            }
+        } else if (IsCreatedByQuery(item)) {
             // Send the creation query to KQP to prepare.
             const auto database = GetDatabase(*Self);
             const TString source = TStringBuilder() << item.SrcPath;
@@ -1447,6 +1546,7 @@ private:
         );
 
         if (!Self->Imports.contains(msg.ImportId)) {
+            Self->RunningImportSchemeGetters.erase(SchemaMappingResult->Sender);
             YDB_LOG_ERROR("TImport::TTxProgress: OnSchemaMappingResult received unknown id",
                 {"id", msg.ImportId},
             );
@@ -1454,6 +1554,18 @@ private:
         }
 
         TImportInfo::TPtr importInfo = Self->Imports.at(msg.ImportId);
+
+        if (importInfo->State != EState::DownloadExportMetadata
+            || !importInfo->SchemaMappingGetter
+            || importInfo->SchemaMappingGetter != SchemaMappingResult->Sender)
+        {
+            Self->RunningImportSchemeGetters.erase(SchemaMappingResult->Sender);
+            YDB_LOG_WARN("TImport::TTxProgress: ignore stale schema mapping getter result",
+                {"id", msg.ImportId},
+                {"sender", SchemaMappingResult->Sender},
+            );
+            return;
+        }
 
         NIceDb::TNiceDb db(txc.DB);
 
@@ -1500,12 +1612,14 @@ private:
 
         auto importInfo = Self->Imports.Value(message.ImportId, nullptr);
         if (!importInfo) {
+            Self->RunningImportSchemeQueryExecutors.erase(SchemeQueryResult->Sender);
             YDB_LOG_ERROR("TImport::TTxProgress: OnSchemeQueryPreparation received unknown import id",
                 {"id", message.ImportId},
             );
             return;
         }
         if (message.ItemIdx >= importInfo->Items.size()) {
+            Self->RunningImportSchemeQueryExecutors.erase(SchemeQueryResult->Sender);
             YDB_LOG_ERROR("TImport::TTxProgress: OnSchemeQueryPreparation item index out of range",
                 {"id", message.ImportId},
                 {"itemIdx", message.ItemIdx},
@@ -1514,10 +1628,61 @@ private:
             return;
         }
 
-        NIceDb::TNiceDb db(txc.DB);
-
         auto& item = importInfo->Items[message.ItemIdx];
+        if (importInfo->State != EState::Waiting
+            || item.State != EState::CreateSchemeObject
+            || !item.SchemeQueryExecutor
+            || item.SchemeQueryExecutor != SchemeQueryResult->Sender
+            || item.CreationQuery.empty()
+            || item.WaitTxId != InvalidTxId)
+        {
+            Self->RunningImportSchemeQueryExecutors.erase(SchemeQueryResult->Sender);
+            YDB_LOG_WARN("TImport::TTxProgress: ignore stale scheme query preparation result",
+                {"id", message.ImportId},
+                {"itemIdx", message.ItemIdx},
+                {"sender", SchemeQueryResult->Sender},
+            );
+            return;
+        }
+
+        NIceDb::TNiceDb db(txc.DB);
         Self->RunningImportSchemeQueryExecutors.erase(std::exchange(item.SchemeQueryExecutor, {}));
+
+        if (item.Table) {
+            if (message.Status != Ydb::StatusIds::SUCCESS || !error.empty()
+                || !std::holds_alternative<NKikimrSchemeOp::TModifyScheme>(message.Result))
+            {
+                TString reason = error;
+                if (reason.empty()) {
+                    reason = TStringBuilder() << "table SQL preparation returned "
+                        << Ydb::StatusIds::StatusCode_Name(message.Status);
+                }
+                if (FallbackToLegacyTableCreation(db, importInfo, message.ItemIdx, reason)) {
+                    AllocateTxId(*importInfo, message.ItemIdx);
+                }
+                return;
+            }
+
+            auto prepared = std::get<NKikimrSchemeOp::TModifyScheme>(message.Result);
+            TString normalizationError;
+            if (!NormalizeTableCreationForImport(
+                    Self, *importInfo, message.ItemIdx, prepared, normalizationError))
+            {
+                if (FallbackToLegacyTableCreation(
+                        db, importInfo, message.ItemIdx, normalizationError))
+                {
+                    AllocateTxId(*importInfo, message.ItemIdx);
+                }
+                return;
+            }
+
+            if (item.State == EState::CreateSchemeObject) {
+                item.PreparedCreationQuery = std::move(prepared);
+                PersistImportItemPreparedCreationQuery(db, *importInfo, message.ItemIdx);
+                AllocateTxId(*importInfo, message.ItemIdx);
+            }
+            return;
+        }
 
         if (message.Status == Ydb::StatusIds::SCHEME_ERROR) {
             // Scheme error happens when the creation query depends on other objects that are not yet imported.
@@ -1573,6 +1738,11 @@ private:
 
             switch (item.State) {
             case EState::CreateSchemeObject:
+                if (item.Table && item.PreparedCreationQuery) {
+                    CreateTable(*importInfo, i, txId);
+                    itemIdx = i;
+                    break;
+                }
                 if (item.PreparedCreationQuery) {
                     ExecutePreparedQuery(txc, importInfo, i, txId);
                     itemIdx = i;
@@ -1686,7 +1856,7 @@ private:
         Y_ABORT_UNLESS(itemIdx < importInfo->Items.size());
         auto& item = importInfo->Items.at(itemIdx);
 
-        if (IsCreatedByQuery(item)) {
+        if (IsNonTableCreatedByQuery(item)) {
             // As for created by query objects query must be compiled to execute
             Y_ABORT_UNLESS(item.PreparedCreationQuery);
 
@@ -1695,10 +1865,16 @@ private:
             }
         }
 
+        const bool tableCreatedImmediately = record.GetStatus() == NKikimrScheme::StatusSuccess
+            && item.State == EState::CreateSchemeObject
+            && item.Table;
+
         if (record.GetStatus() == NKikimrScheme::StatusSuccess) {
             Self->TxIdToImport.erase(txId);
             txId = InvalidTxId;
-            item.State = EState::Done;
+            if (!tableCreatedImmediately) {
+                item.State = EState::Done;
+            }
         } else if (record.GetStatus() != NKikimrScheme::StatusAccepted) {
             Self->TxIdToImport.erase(txId);
             txId = InvalidTxId;
@@ -1708,7 +1884,7 @@ private:
             )) {
                 if (record.GetPathCreateTxId()) {
                     txId = TTxId(record.GetPathCreateTxId());
-                } else if (item.State == EState::CreateSchemeObject) {
+                } else if (item.State == EState::CreateSchemeObject && IsNonTableCreatedByQuery(item)) {
                     // In case dependency object is being created
                     return DelayObjectCreation(importInfo, itemIdx, db, record.GetReason(), ctx);
                 } else if (item.State == EState::Transferring) {
@@ -1757,6 +1933,10 @@ private:
             }
         }
 
+        if (tableCreatedImmediately) {
+            ContinueAfterTableCreation(db, *importInfo, itemIdx);
+        }
+
         if (txId != InvalidTxId) {
             SubscribeTx(*importInfo, itemIdx);
         }
@@ -1785,6 +1965,24 @@ private:
 
         item.DstPathId = path.Base()->PathId;
         Self->PersistImportItemDstPathId(db, importInfo, itemIdx);
+    }
+
+    void ContinueAfterTableCreation(NIceDb::TNiceDb& db, TImportInfo& importInfo, ui32 itemIdx) {
+        Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
+        auto& item = importInfo.Items.at(itemIdx);
+        Y_ABORT_UNLESS(item.Table);
+
+        for (const auto childIdx : item.ChildItems) {
+            Y_ABORT_UNLESS(childIdx < importInfo.Items.size());
+            auto& childItem = importInfo.Items.at(childIdx);
+            childItem.State = EState::Transferring;
+            Self->PersistImportItemState(db, importInfo, childIdx);
+            AllocateTxId(importInfo, childIdx);
+        }
+
+        item.State = EState::Transferring;
+        Self->PersistImportItemState(db, importInfo, itemIdx);
+        AllocateTxId(importInfo, itemIdx);
     }
 
     void OnCreateIndexResult(TTransactionContext& txc, const TActorContext&) {
@@ -1904,7 +2102,7 @@ private:
 
         switch (item.State) {
         case EState::CreateSchemeObject:
-            if (IsCreatedByQuery(item)) {
+            if (IsNonTableCreatedByQuery(item)) {
                 item.State = EState::Done;
                 break;
             } else if (item.Topic) {
@@ -1912,19 +2110,10 @@ private:
                 break;
             }
             if (item.Table) {
-                for (auto childIdx : item.ChildItems) {
-                    Y_ABORT_UNLESS(childIdx < importInfo->Items.size());
-                    auto& childItem = importInfo->Items.at(childIdx);
-
-                    childItem.State = EState::Transferring;
-                    Self->PersistImportItemState(db, *importInfo, childIdx);
-                    AllocateTxId(*importInfo, childIdx);
-                }
+                ContinueAfterTableCreation(db, *importInfo, itemIdx);
             } else {
                 Y_ABORT("Create Scheme Object: schema objects are empty");
             }
-            item.State = EState::Transferring;
-            AllocateTxId(*importInfo, itemIdx);
             break;
 
         case EState::Transferring:

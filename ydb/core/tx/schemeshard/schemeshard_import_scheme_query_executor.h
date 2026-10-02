@@ -4,6 +4,17 @@
 
 namespace NKikimr::NSchemeShard {
 
-NActors::IActor* CreateSchemeQueryExecutor(NActors::TActorId replyTo, ui64 importId, ui32 itemIdx, const TString& creationQuery, const TString& database);
+enum class EImportSchemeQueryKind {
+    Other,
+    Table,
+};
+
+NActors::IActor* CreateSchemeQueryExecutor(
+    NActors::TActorId replyTo,
+    ui64 importId,
+    ui32 itemIdx,
+    const TString& creationQuery,
+    const TString& database,
+    EImportSchemeQueryKind queryKind = EImportSchemeQueryKind::Other);
 
 }

@@ -412,6 +412,91 @@ Y_UNIT_TEST_SUITE_F(EncryptedExportTest, TBackupEncryptionTestFixture) {
         }
     }
 
+    Y_UNIT_TEST(SqlImportEncryptedCreationArtifactIntegrity) {
+        Server().GetRuntime()->GetAppData().FeatureFlags.SetEnableChecksumsExport(true);
+        Server().GetRuntime()->GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+
+        static const TString EncryptionKey = "Cool random key!";
+        NExport::TExportToS3Settings exportSettings = MakeExportSettings(
+            "/Root/EncryptedExportAndImport/dir1/dir2", "SqlImportEncrypted");
+        exportSettings.SymmetricEncryption(
+            NExport::TExportToS3Settings::TEncryptionAlgorithm::AES_128_GCM,
+            EncryptionKey);
+
+        auto exportResult = YdbExportClient().ExportToS3(exportSettings).GetValueSync();
+        WaitOpSuccess(exportResult);
+
+        static const TString SqlKey =
+            "/test_bucket/SqlImportEncrypted/001/create_table.sql.enc";
+        static const TString SqlChecksumKey =
+            "/test_bucket/SqlImportEncrypted/001/create_table.sql.sha256";
+        static const TString SchemeKey =
+            "/test_bucket/SqlImportEncrypted/001/scheme.pb.enc";
+        UNIT_ASSERT_C(S3Mock().GetData().contains(SqlKey), "encrypted SQL artifact is missing");
+        UNIT_ASSERT_C(S3Mock().GetData().contains(SqlChecksumKey), "encrypted SQL checksum is missing");
+        UNIT_ASSERT_C(S3Mock().GetData().contains(SchemeKey), "encrypted table descriptor is missing");
+
+        NBackup::TEncryptionKey encryptionKey(EncryptionKey);
+        TBuffer sqlPlaintext;
+        TBuffer schemePlaintext;
+        NBackup::TEncryptionIV sqlIv;
+        NBackup::TEncryptionIV schemeIv;
+        UNIT_ASSERT_NO_EXCEPTION(std::tie(sqlPlaintext, sqlIv) =
+            NBackup::TEncryptedFileDeserializer::DecryptFullFile(
+                encryptionKey,
+                TBuffer(S3Mock().GetData().at(SqlKey).data(), S3Mock().GetData().at(SqlKey).size())));
+        UNIT_ASSERT_NO_EXCEPTION(std::tie(schemePlaintext, schemeIv) =
+            NBackup::TEncryptedFileDeserializer::DecryptFullFile(
+                encryptionKey,
+                TBuffer(S3Mock().GetData().at(SchemeKey).data(), S3Mock().GetData().at(SchemeKey).size())));
+        UNIT_ASSERT_VALUES_UNEQUAL(sqlIv.GetBinaryString(), schemeIv.GetBinaryString());
+
+        size_t attempt = 0;
+        auto makeImportSettings = [&](const TString& key) {
+            const TString destination = TStringBuilder()
+                << "/Root/SqlImportEncrypted_" << attempt++;
+            auto settings = MakeImportSettings("SqlImportEncrypted", destination);
+            settings.SymmetricKey(key);
+            return std::pair(std::move(settings), destination);
+        };
+        auto importSucceeds = [&]() {
+            auto [settings, destination] = makeImportSettings(EncryptionKey);
+            auto result = YdbImportClient().ImportFromS3(settings).GetValueSync();
+            WaitOpSuccess(result);
+            CheckRestoredData(destination + "/EncryptedExportAndImportTable");
+            ForgetOp(result);
+        };
+        auto importFails = [&](const TString& key) {
+            auto [settings, _] = makeImportSettings(key);
+            auto result = YdbImportClient().ImportFromS3(settings).GetValueSync();
+            WaitOpStatus(result, NYdb::EStatus::CANCELLED);
+            ForgetOp(result);
+        };
+
+        importSucceeds();
+
+        const TString encryptedSql = S3Mock().GetData().at(SqlKey);
+        S3Mock().GetData().erase(SqlKey);
+        importSucceeds();
+        S3Mock().GetData()[SqlKey] = encryptedSql;
+
+        auto reencryptedSql = NBackup::TEncryptedFileSerializer::EncryptFullFile(
+            TString(NExport::TExportToS3Settings::TEncryptionAlgorithm::AES_128_GCM),
+            encryptionKey,
+            NBackup::TEncryptionIV::Generate(),
+            TStringBuf(sqlPlaintext.Data(), sqlPlaintext.Size()));
+        S3Mock().GetData()[SqlKey] = TString(reencryptedSql.Data(), reencryptedSql.Size());
+        importFails(EncryptionKey);
+        S3Mock().GetData()[SqlKey] = encryptedSql;
+
+        const TString sqlChecksum = S3Mock().GetData().at(SqlChecksumKey);
+        S3Mock().GetData()[SqlChecksumKey] = ModifyHexEncodedString(sqlChecksum);
+        importFails(EncryptionKey);
+        S3Mock().GetData()[SqlChecksumKey] = sqlChecksum;
+
+        importFails("A different encryption key");
+    }
+
     Y_UNIT_TEST_TWIN(EncryptionAndCompression, IsOlap) {
         {
             NExport::TExportToS3Settings settings = MakeExportSettings("/Root/EncryptedExportAndImport/dir1/dir2", "Prefix");
@@ -1119,24 +1204,21 @@ protected:
             };
 
             const bool isOptionalCreateTable = key.EndsWith("/create_table.sql.enc");
-            const auto checkImport = [&](const TString& comments) {
-                if (isOptionalCreateTable) {
-                    checkImportSucceeds(comments);
-                } else {
-                    checkImportFails(comments);
-                }
-            };
 
             // Remove one file from export.
             // In case of encrypted backup it must cause error,
             // because no one should be able not modify export files,
             // in particular, remove an export part (==file).
             S3Mock().GetData().erase(key);
-            checkImport(TStringBuilder() << "Remove key " << key);
+            if (isOptionalCreateTable) {
+                checkImportSucceeds(TStringBuilder() << "Remove optional key " << key);
+            } else {
+                checkImportFails(TStringBuilder() << "Remove key " << key);
+            }
 
             // Change IV (reencrypt with different, not expected, IV)
             S3Mock().GetData()[key] = ReencryptWithDifferentIV(sourceValue, encryptionKey, NExport::TExportToS3Settings::TEncryptionAlgorithm::AES_128_GCM);
-            checkImport(TStringBuilder() << "Change IV of " << key);
+            checkImportFails(TStringBuilder() << "Change IV of " << key);
         }
     }
 };

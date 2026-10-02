@@ -59,48 +59,52 @@ THolder<TEvSchemeShard::TEvModifySchemeTransaction> CreateTablePropose(
     auto& record = propose->Record;
 
     auto& modifyScheme = *record.AddTransaction();
-    const bool isColumnTable = item.Table->store_type() == Ydb::Table::STORE_TYPE_COLUMN;
-    modifyScheme.SetOperationType(isColumnTable ? NKikimrSchemeOp::ESchemeOpCreateColumnTable : NKikimrSchemeOp::ESchemeOpCreateIndexedTable);
-    modifyScheme.SetInternal(true);
-
-    const TPath domainPath = TPath::Init(importInfo.DomainPathId, ss);
-
-    std::pair<TString, TString> wdAndPath;
-    if (!TrySplitPathByDb(item.DstPathName, domainPath.PathString(), wdAndPath, error)) {
-        return nullptr;
-    }
-
-    modifyScheme.SetWorkingDir(wdAndPath.first);
-
-    if (isColumnTable) {
-        auto& tableDesc = *modifyScheme.MutableCreateColumnTable();
-        tableDesc.SetName(wdAndPath.second);
-        tableDesc.SetIsRestore(true);
-
-        Y_ABORT_UNLESS(ss->TableProfilesLoaded);
-        Ydb::StatusIds::StatusCode status;
-        if (!FillColumnTableDescription(modifyScheme, *item.Table, status, error)) {
-            return nullptr;
-        }
+    if (item.PreparedCreationQuery) {
+        modifyScheme.CopyFrom(*item.PreparedCreationQuery);
     } else {
-        auto& indexedTable = *modifyScheme.MutableCreateIndexedTable();
-        auto& tableDesc = *indexedTable.MutableTableDescription();
-        tableDesc.SetName(wdAndPath.second);
-        tableDesc.SetIsRestore(true);
+        const bool isColumnTable = item.Table->store_type() == Ydb::Table::STORE_TYPE_COLUMN;
+        modifyScheme.SetOperationType(isColumnTable ? NKikimrSchemeOp::ESchemeOpCreateColumnTable : NKikimrSchemeOp::ESchemeOpCreateIndexedTable);
+        modifyScheme.SetInternal(true);
 
-        Y_ABORT_UNLESS(ss->TableProfilesLoaded);
-        Ydb::StatusIds::StatusCode status;
-        if (!FillTableDescription(modifyScheme, *item.Table, ss->TableProfiles, status, error, true)) {
+        const TPath domainPath = TPath::Init(importInfo.DomainPathId, ss);
+
+        std::pair<TString, TString> wdAndPath;
+        if (!TrySplitPathByDb(item.DstPathName, domainPath.PathString(), wdAndPath, error)) {
             return nullptr;
         }
 
-        if (!NeedToBuildIndexes(importInfo, itemIdx) && !FillIndexDescription(indexedTable, *item.Table,
-                ss->EnableCompactFulltextIndex, status, error)) {
-            return nullptr;
-        }
+        modifyScheme.SetWorkingDir(wdAndPath.first);
 
-        if (!FillDefaultValues(item, indexedTable, error)) {
-            return nullptr;
+        if (isColumnTable) {
+            auto& tableDesc = *modifyScheme.MutableCreateColumnTable();
+            tableDesc.SetName(wdAndPath.second);
+            tableDesc.SetIsRestore(true);
+
+            Y_ABORT_UNLESS(ss->TableProfilesLoaded);
+            Ydb::StatusIds::StatusCode status;
+            if (!FillColumnTableDescription(modifyScheme, *item.Table, status, error)) {
+                return nullptr;
+            }
+        } else {
+            auto& indexedTable = *modifyScheme.MutableCreateIndexedTable();
+            auto& tableDesc = *indexedTable.MutableTableDescription();
+            tableDesc.SetName(wdAndPath.second);
+            tableDesc.SetIsRestore(true);
+
+            Y_ABORT_UNLESS(ss->TableProfilesLoaded);
+            Ydb::StatusIds::StatusCode status;
+            if (!FillTableDescription(modifyScheme, *item.Table, ss->TableProfiles, status, error, true)) {
+                return nullptr;
+            }
+
+            if (!NeedToBuildIndexes(importInfo, itemIdx) && !FillIndexDescription(indexedTable, *item.Table,
+                    ss->EnableCompactFulltextIndex, status, error)) {
+                return nullptr;
+            }
+
+            if (!FillDefaultValues(item, indexedTable, error)) {
+                return nullptr;
+            }
         }
     }
 

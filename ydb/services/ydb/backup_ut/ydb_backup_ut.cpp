@@ -1,5 +1,6 @@
 #include "ydb_common_ut.h"
 
+#include <ydb/core/backup/common/checksum.h>
 #include <ydb/core/protos/flat_scheme_op.pb.h>
 #include <ydb/core/wrappers/ut_helpers/s3_mock.h>
 #include <ydb/library/aws_init/aws.h>
@@ -28,6 +29,7 @@
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/value/value.h>
 
 #include <ydb/library/backup/backup.h>
+#include <ydb/library/backup/proto/proto.h>
 #include <ydb/library/testlib/helpers.h>
 
 #include <library/cpp/regex/pcre/regexp.h>
@@ -4286,6 +4288,10 @@ Y_UNIT_TEST_SUITE(BackupRestoreS3) {
         ui16 GetS3Port() const {
             return S3Port;
         }
+
+        TS3Mock& GetS3Mock() {
+            return S3Mock;
+        }
     };
 
     template <typename TOperation>
@@ -4416,6 +4422,88 @@ Y_UNIT_TEST_SUITE(BackupRestoreS3) {
             }
             ImportFromS3(importClient, s3Port, operationClient, std::move(items));
         };
+    }
+
+    Y_UNIT_TEST(SqlImportCurrentExportRowTableRoundTrip) {
+        TS3TestEnv testEnv;
+        testEnv.GetServer().GetRuntime()->GetAppData().FeatureFlags.SetEnableChecksumsExport(true);
+        testEnv.GetServer().GetRuntime()->GetAppData().FeatureFlags.SetEnableTableBackupAsSql(true);
+
+        auto& session = testEnv.GetQuerySession();
+        ExecuteQuery(session, R"(
+            CREATE TABLE `/Root/sql_import_current_export` (
+                Key Uint32 NOT NULL,
+                Value Utf8 DEFAULT 'sql-default',
+                PRIMARY KEY (Key)
+            );
+        )", true);
+        ExecuteQuery(session, R"(
+            UPSERT INTO `/Root/sql_import_current_export` (Key, Value)
+            VALUES (1, 'imported-value');
+        )");
+
+        auto backup = CreateBackupLambda(testEnv.GetDriver(), testEnv.GetS3Port());
+        backup();
+
+        static const TString SqlKey =
+            "/test_bucket/sql_import_current_export/create_table.sql";
+        static const TString SchemeKey =
+            "/test_bucket/sql_import_current_export/scheme.pb";
+        static const TString SchemeChecksumKey =
+            "/test_bucket/sql_import_current_export/scheme.pb.sha256";
+        auto& objects = testEnv.GetS3Mock().GetData();
+        UNIT_ASSERT_C(objects.contains(SqlKey), "current export did not write table SQL");
+        UNIT_ASSERT_C(objects.contains(SchemeKey), "current export did not write the table descriptor");
+        UNIT_ASSERT_C(objects.contains(SchemeChecksumKey), "current export did not write the descriptor checksum");
+
+        Ydb::Table::CreateTableRequest descriptor;
+        UNIT_ASSERT_C(NYdb::NBackup::ParseProto(objects.at(SchemeKey), descriptor),
+            "cannot parse the exported table descriptor");
+        bool changedDefault = false;
+        for (auto& column : *descriptor.mutable_columns()) {
+            if (column.name() == "Value") {
+                auto* literal = column.mutable_from_literal();
+                literal->mutable_type()->set_type_id(Ydb::Type::UTF8);
+                literal->mutable_value()->set_text_value("protobuf-default");
+                changedDefault = true;
+                break;
+            }
+        }
+        UNIT_ASSERT_C(changedDefault, "the exported Value column is missing");
+        UNIT_ASSERT_C(NYdb::NBackup::PrintProto(descriptor, objects[SchemeKey]),
+            "cannot serialize the modified table descriptor");
+        objects[SchemeChecksumKey] = NKikimr::NBackup::ComputeChecksum(objects.at(SchemeKey));
+
+        ExecuteQuery(session, "DROP TABLE `/Root/sql_import_current_export`;", true);
+
+        NImport::TImportClient importClient(testEnv.GetDriver());
+        NOperation::TOperationClient operationClient(testEnv.GetDriver());
+        ImportFromS3(importClient, testEnv.GetS3Port(), operationClient, {
+            {
+                .Src = "sql_import_current_export",
+                .Dst = "/Root/sql_import_restored",
+            },
+        });
+
+        ExecuteQuery(session, R"(
+            UPSERT INTO `/Root/sql_import_restored` (Key)
+            VALUES (2);
+        )");
+        const auto result = ExecuteQuery(session, R"(
+            SELECT Value FROM `/Root/sql_import_restored`
+            WHERE Key = 2;
+        )");
+        TResultSetParser parser(result.GetResultSet(0));
+        UNIT_ASSERT(parser.TryNextRow());
+        const auto restoredDefault = parser.ColumnParser("Value").GetOptionalUtf8();
+        UNIT_ASSERT_C(restoredDefault, "restored default is null");
+        UNIT_ASSERT_VALUES_EQUAL(*restoredDefault, "sql-default");
+
+        const auto importedRows = GetTableContent(session, "/Root/sql_import_restored");
+        TResultSetParser importedRowsParser(importedRows.GetResultSet(0));
+        UNIT_ASSERT(importedRowsParser.TryNextRow());
+        UNIT_ASSERT_VALUES_EQUAL(importedRowsParser.ColumnParser("Key").GetUint32(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(*importedRowsParser.ColumnParser("Value").GetOptionalUtf8(), "imported-value");
     }
 
     Y_UNIT_TEST(RestoreTablePartitioningSettings) {

@@ -1738,6 +1738,7 @@ struct Schema : NIceDb::Schema {
         struct EndTime : Column<12, NScheme::NTypeIds::Uint64> {};
         struct PeerName : Column<13, NScheme::NTypeIds::Utf8> {};
         struct SanitizedToken : Column<14, NScheme::NTypeIds::Utf8> {};
+        struct EnableTableBackupAsSql : Column<15, NScheme::NTypeIds::Bool> {};
 
         using TKey = TableKey<Id>;
         using TColumns = TableColumns<
@@ -1754,7 +1755,8 @@ struct Schema : NIceDb::Schema {
             StartTime,
             EndTime,
             PeerName,
-            SanitizedToken
+            SanitizedToken,
+            EnableTableBackupAsSql
         >;
     };
 
