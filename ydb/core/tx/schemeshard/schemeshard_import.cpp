@@ -4,9 +4,11 @@
 #include "schemeshard_import_getters.h"
 #include "schemeshard_import_helpers.h"
 
+#include <ydb/core/base/table_index.h>
 #include <ydb/core/tx/schemeshard/index/index_build_info.h>
 
 #include <util/generic/xrange.h>
+#include <util/string/builder.h>
 
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::IMPORT
 
@@ -27,15 +29,53 @@ namespace {
         }
     }
 
+    void FillWarnings(NKikimrImport::TImport& import, const TImportInfo& importInfo) {
+        for (const auto& item : importInfo.Items) {
+            if (item.TableSchemaPlan && item.TableSchemaPlan->GetFallbackReason()) {
+                AddIssue(
+                    import,
+                    TStringBuilder() << "table SQL was not used: "
+                        << item.TableSchemaPlan->GetFallbackReason(),
+                    NYql::TSeverityIds::S_WARNING);
+            }
+        }
+    }
+
+    int StateProgressRank(TImportInfo::EState state) {
+        switch (state) {
+            case TImportInfo::EState::Invalid:
+                return -1;
+            case TImportInfo::EState::DownloadExportMetadata:
+            case TImportInfo::EState::GetScheme:
+            case TImportInfo::EState::CreateSchemeObject:
+                return 0;
+            case TImportInfo::EState::Transferring:
+            case TImportInfo::EState::WaitingForIndexData:
+                return 1;
+            case TImportInfo::EState::BuildIndexes:
+                return 2;
+            case TImportInfo::EState::CreateChangefeed:
+                return 3;
+            case TImportInfo::EState::Done:
+                return 4;
+            case TImportInfo::EState::Waiting:
+                return 0;
+            case TImportInfo::EState::Cancellation:
+                return 5;
+            case TImportInfo::EState::Cancelled:
+                return 6;
+        }
+        return -1;
+    }
+
     TImportInfo::EState GetMinState(const TImportInfo& importInfo) {
         TImportInfo::EState state = TImportInfo::EState::Invalid;
 
         for (const auto& item : importInfo.Items) {
-            if (state == TImportInfo::EState::Invalid) {
+            if (state == TImportInfo::EState::Invalid
+                || StateProgressRank(item.State) < StateProgressRank(state)) {
                 state = item.State;
             }
-
-            state = Min(state, item.State);
         }
 
         return state;
@@ -101,9 +141,14 @@ namespace {
         if (!item.Table) {
             return;
         }
-        Y_ABORT_UNLESS(indexIdx < item.Table->indexes_size());
+        const i32 indexCount = item.UsesSqlSchema()
+            ? item.TableSchemaPlan->IndexesSize()
+            : item.Table->indexes_size();
+        Y_ABORT_UNLESS(indexIdx < indexCount);
 
-        const ui32 partsTotal = GetTablePartsFromRequest(*item.Table);
+        const ui32 partsTotal = ss->Tables.contains(item.DstPathId)
+            ? static_cast<ui32>(ss->Tables.at(item.DstPathId)->GetPartitions().size())
+            : GetTablePartsFromRequest(*item.Table);
 
         const auto buildUid = MakeIndexBuildUid(importInfo, itemIdx, indexIdx);
         if (ss->IndexBuildsByUid.contains(buildUid)) {
@@ -134,11 +179,24 @@ namespace {
 
         Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
         const auto& item = importInfo.Items.at(itemIdx);
-        if (!item.Table || !itemProgress.has_start_time()) {
+        if (!item.Table || !itemProgress.has_start_time()
+            || !NeedToBuildIndexes(importInfo, itemIdx)) {
             return;
         }
 
-        for (i32 indexIdx : xrange(item.Table->indexes_size())) {
+        const i32 indexCount = item.UsesSqlSchema()
+            ? item.TableSchemaPlan->IndexesSize()
+            : item.Table->indexes_size();
+        for (i32 indexIdx : xrange(indexCount)) {
+            if (item.UsesSqlSchema()) {
+                if (IsLocalIndexType(
+                        item.TableSchemaPlan->GetIndexes(indexIdx).GetType())) {
+                    continue;
+                }
+            } else if (NTableIndex::IsLocalTableIndex(
+                    item.Table->indexes(indexIdx).type_case())) {
+                continue;
+            }
             AddBuildIndexesItemProgress(ss, importInfo, itemIdx, indexIdx, itemProgress);
         }
     }
@@ -160,6 +218,8 @@ void TSchemeShard::FromXxportInfo(NKikimrImport::TImport& import, const TImportI
         import.SetUserSID(*importInfo.UserSID);
     }
 
+    FillWarnings(import, importInfo);
+
     switch (importInfo.State) {
     case TImportInfo::EState::DownloadExportMetadata:
         import.SetProgress(Ydb::Import::ImportProgress::PROGRESS_PREPARING);
@@ -171,6 +231,7 @@ void TSchemeShard::FromXxportInfo(NKikimrImport::TImport& import, const TImportI
             import.SetProgress(Ydb::Import::ImportProgress::PROGRESS_PREPARING);
             break;
         case TImportInfo::EState::Transferring:
+        case TImportInfo::EState::WaitingForIndexData:
             for (ui32 itemIdx : xrange(importInfo.Items.size())) {
                 FillItemProgress(this, importInfo, itemIdx, *import.AddItemsProgress());
             }
@@ -378,7 +439,11 @@ void TSchemeShard::PersistImportItemScheme(NIceDb::TNiceDb& db, const TImportInf
         record.Update(
             NIceDb::TUpdate<Schema::ImportItems::CreationQuery>(item.CreationQuery)
         );
+    } else {
+        record.Update(NIceDb::TNull<Schema::ImportItems::CreationQuery>());
     }
+
+    PersistImportItemTableSchemaPlan(db, importInfo, itemIdx);
 
     if (item.Permissions.Defined()) {
         record.Update(
@@ -399,10 +464,27 @@ void TSchemeShard::PersistImportItemPreparedCreationQuery(NIceDb::TNiceDb& db, c
     Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
     const auto& item = importInfo.Items[itemIdx];
 
+    auto record = db.Table<Schema::ImportItems>().Key(importInfo.Id, itemIdx);
     if (item.PreparedCreationQuery) {
-        db.Table<Schema::ImportItems>().Key(importInfo.Id, itemIdx).Update(
+        record.Update(
             NIceDb::TUpdate<Schema::ImportItems::PreparedCreationQuery>(item.PreparedCreationQuery->SerializeAsString())
         );
+    } else {
+        record.Update(NIceDb::TNull<Schema::ImportItems::PreparedCreationQuery>());
+    }
+}
+
+void TSchemeShard::PersistImportItemTableSchemaPlan(NIceDb::TNiceDb& db, const TImportInfo& importInfo, ui32 itemIdx) {
+    Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
+    const auto& item = importInfo.Items[itemIdx];
+
+    auto record = db.Table<Schema::ImportItems>().Key(importInfo.Id, itemIdx);
+    if (item.TableSchemaPlan) {
+        record.Update(
+            NIceDb::TUpdate<Schema::ImportItems::TableSchemaPlan>(item.TableSchemaPlan->SerializeAsString())
+        );
+    } else {
+        record.Update(NIceDb::TNull<Schema::ImportItems::TableSchemaPlan>());
     }
 }
 
@@ -489,7 +571,8 @@ bool NeedToBuildIndexes(const TImportInfo& importInfo, ui32 itemIdx) {
         case Ydb::Import::ImportFromS3Settings::INDEX_POPULATION_MODE_BUILD:
             return true;
         case Ydb::Import::ImportFromS3Settings::INDEX_POPULATION_MODE_AUTO:
-            return item.ChildItems.empty();
+            return item.ChildItems.empty()
+                || (item.TableSchemaPlan && item.TableSchemaPlan->GetForceBuildIndexes());
         case Ydb::Import::ImportFromS3Settings::INDEX_POPULATION_MODE_IMPORT:
             return false;
         default:

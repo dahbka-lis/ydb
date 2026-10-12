@@ -3263,6 +3263,22 @@ bool TImportInfo::IsFinished() const {
     return State == EState::Done || State == EState::Cancelled;
 }
 
+bool TImportInfo::HasPendingCancellationWork() const {
+    return AnyOf(Items, [](const TItem& item) {
+        if (!IsIn({
+                EState::CreateSchemeObject,
+                EState::Transferring,
+                EState::BuildIndexes,
+                EState::CreateChangefeed,
+            }, item.State)) {
+            return false;
+        }
+
+        return item.WaitTxId != InvalidTxId
+            || item.SubState == TItem::ESubState::Proposed;
+    });
+}
+
 void TImportInfo::AddNotifySubscriber(const TActorId &actorId) {
     Y_ENSURE(!IsFinished());
     Subscribers.insert(actorId);

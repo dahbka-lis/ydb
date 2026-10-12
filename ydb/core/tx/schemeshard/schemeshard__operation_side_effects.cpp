@@ -1011,6 +1011,31 @@ void TSideEffects::DoDoneTransactions(TSchemeShard *ss, NTabletFlatExecutor::TTr
 
         NIceDb::TNiceDb db(txc.DB);
 
+        // Import proposals are sent to this SchemeShard through the actor
+        // mailbox after their durable WaitTxId has been stored.  A tablet
+        // reboot may lose the StatusAccepted reply, though, and by the time
+        // the importer resumes the operation may already have disappeared
+        // from TxInFlight.  Persist the acceptance fence atomically with the
+        // operation completion/removal so Resume never replays a completed
+        // non-idempotent SQL companion (notably ALTER SEQUENCE RESTART).
+        if (const auto* importRef = ss->TxIdToImport.FindPtr(txId)) {
+            const auto [importId, itemIdx] = *importRef;
+            if (const auto* importInfo = ss->Imports.FindPtr(importId);
+                importInfo && itemIdx < (*importInfo)->Items.size()) {
+                auto& item = (*importInfo)->Items[itemIdx];
+                if (item.UsesSqlSchema()
+                    && IsIn({
+                        TImportInfo::EState::CreateSchemeObject,
+                        TImportInfo::EState::CreateChangefeed,
+                    }, item.State)
+                    && item.WaitTxId == txId
+                    && !item.TableSchemaPlan->GetCurrentOperationAccepted()) {
+                    item.TableSchemaPlan->SetCurrentOperationAccepted(true);
+                    ss->PersistImportItemTableSchemaPlan(db, **importInfo, itemIdx);
+                }
+            }
+        }
+
         for (auto& item: operation->ReleasePathAtDone) {
             TPathId pathId = item.first;
             NKikimrSchemeOp::EPathState state = item.second;

@@ -13,4 +13,32 @@ TString MakeIndexBuildUid(const TImportInfo& importInfo, ui32 itemIdx) {
     return MakeIndexBuildUid(importInfo, itemIdx, item.NextIndexIdx);
 }
 
+bool IsLocalIndexType(NKikimrSchemeOp::EIndexType type) {
+    switch (type) {
+        case NKikimrSchemeOp::EIndexTypeLocalBloomFilter:
+        case NKikimrSchemeOp::EIndexTypeLocalBloomNgramFilter:
+        case NKikimrSchemeOp::EIndexTypeLocalMinMax:
+        case NKikimrSchemeOp::EIndexTypeLocalCountMinSketch:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ShouldRestoreIndexImplementationData(
+    Ydb::Import::ImportFromS3Settings::IndexPopulationMode populationMode,
+    bool backupIncomplete)
+{
+    switch (populationMode) {
+        case Ydb::Import::ImportFromS3Settings::INDEX_POPULATION_MODE_IMPORT:
+            return true;
+        case Ydb::Import::ImportFromS3Settings::INDEX_POPULATION_MODE_AUTO:
+            return !backupIncomplete;
+        case Ydb::Import::ImportFromS3Settings::INDEX_POPULATION_MODE_BUILD:
+        case Ydb::Import::ImportFromS3Settings::INDEX_POPULATION_MODE_UNSPECIFIED:
+            return false;
+    }
+    return false;
+}
+
 } // NKikimr::NSchemeShard

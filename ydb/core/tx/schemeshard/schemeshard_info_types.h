@@ -3956,6 +3956,7 @@ struct TImportInfo: public TSimpleRefCount<TImportInfo> {
         BuildIndexes = 5,
         CreateChangefeed = 6,
         DownloadExportMetadata = 7,
+        WaitingForIndexData = 8,
         Done = 240,
         Cancellation = 250,
         Cancelled = 251,
@@ -3987,6 +3988,7 @@ struct TImportInfo: public TSimpleRefCount<TImportInfo> {
         TMaybe<Ydb::Table::DescribeSystemViewResult> SysView;
         TString CreationQuery;
         TMaybe<NKikimrSchemeOp::TModifyScheme> PreparedCreationQuery;
+        TMaybe<NKikimrImport::TTableSchemaImportPlan> TableSchemaPlan;
         TMaybeFail<Ydb::Scheme::ModifyPermissionsRequest> Permissions;
         NBackup::TMetadata Metadata;
         TVector<std::pair<NBackup::TIndexMetadata, Ydb::Table::CreateTableRequest>> MaterializedIndexes;
@@ -4021,6 +4023,59 @@ struct TImportInfo: public TSimpleRefCount<TImportInfo> {
         }
 
         TString ToString(ui32 idx) const;
+
+        bool IsTableItem() const {
+            return Table.Defined();
+        }
+
+        bool IsLegacyQueryObject() const {
+            return !IsTableItem() && !CreationQuery.empty();
+        }
+
+        NKikimrImport::TTableSchemaImportPlan::ESchemaSource GetTableSchemaSource() const {
+            if (TableSchemaPlan) {
+                return TableSchemaPlan->GetSource();
+            }
+            return IsTableItem()
+                ? NKikimrImport::TTableSchemaImportPlan::SCHEMA_SOURCE_PROTOBUF
+                : NKikimrImport::TTableSchemaImportPlan::SCHEMA_SOURCE_UNDECIDED;
+        }
+
+        bool UsesSqlSchema() const {
+            return IsTableItem()
+                && GetTableSchemaSource() == NKikimrImport::TTableSchemaImportPlan::SCHEMA_SOURCE_SQL;
+        }
+
+        bool UsesSqlPreparation() const {
+            return UsesSqlSchema()
+                && TableSchemaPlan->GetStatementCursor() < static_cast<ui32>(TableSchemaPlan->StatementsSize());
+        }
+
+        bool NeedsDataRestore() const {
+            return IsTableItem();
+        }
+
+        bool CanFallbackToProtobuf() const {
+            return UsesSqlSchema()
+                && !TableSchemaPlan->GetFirstMutationCompleted()
+                && !TableSchemaPlan->GetCurrentOperationAccepted()
+                && WaitTxId == InvalidTxId;
+        }
+
+        void ResetToProtobufSchema(TString fallbackReason) {
+            const ui64 nextAttempt = TableSchemaPlan
+                ? TableSchemaPlan->GetPreparationAttempt() + 1
+                : 1;
+            NKikimrImport::TTableSchemaImportPlan fallback;
+            fallback.SetFormatVersion(1);
+            fallback.SetSource(NKikimrImport::TTableSchemaImportPlan::SCHEMA_SOURCE_PROTOBUF);
+            fallback.SetFallbackReason(std::move(fallbackReason));
+            fallback.SetPreparationAttempt(nextAttempt);
+            TableSchemaPlan = std::move(fallback);
+            CreationQuery.clear();
+            PreparedCreationQuery.Clear();
+            SchemeQueryExecutor = {};
+        }
 
         static bool IsDone(const TItem& item);
     };
@@ -4184,6 +4239,12 @@ public:
     TString ToString() const;
 
     bool IsFinished() const;
+
+    // Cancellation is not terminal while an import-owned request may still
+    // create or alter schema.  In particular, SQL DDL proposals cannot be
+    // cancelled by the generic backup/restore cancellation operation and
+    // must be observed to completion before Forget may remove their fences.
+    bool HasPendingCancellationWork() const;
 
     void AddNotifySubscriber(const TActorId& actorId);
 

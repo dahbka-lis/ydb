@@ -8,6 +8,8 @@
 #include <ydb/core/protos/flat_scheme_op.pb.h>
 #include <ydb/core/ydb_convert/table_settings.h>
 
+#include <util/generic/algorithm.h>
+
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::BUILD_INDEX
 
 namespace NKikimr::NSchemeShard {
@@ -16,6 +18,135 @@ static constexpr ui32 DefaultMaxShardsInFlight = 32;
 
 using namespace NTabletFlatExecutor;
 using NKikimrSchemeOp::EIndexType;
+
+namespace {
+
+TMaybe<EIndexType> ParseInternalIndexType(
+    const NKikimrIndexBuilder::TEvCreateRequest& request,
+    TString& error)
+{
+    if (!request.HasInternalIndexType()) {
+        return Nothing();
+    }
+    if (!request.GetInternal()) {
+        error = "InternalIndexType is allowed only for internal index builds";
+        return Nothing();
+    }
+
+    const auto type = static_cast<EIndexType>(request.GetInternalIndexType());
+    switch (type) {
+        case EIndexType::EIndexTypeGlobal:
+        case EIndexType::EIndexTypeGlobalAsync:
+        case EIndexType::EIndexTypeGlobalUnique:
+        case EIndexType::EIndexTypeGlobalVectorKmeansTree:
+        case EIndexType::EIndexTypeGlobalFulltextPlain:
+        case EIndexType::EIndexTypeGlobalFulltextRelevance:
+        case EIndexType::EIndexTypeGlobalJson:
+        case EIndexType::EIndexTypeGlobalFulltextCompact:
+        case EIndexType::EIndexTypeGlobalFulltextCompactRelevance:
+        case EIndexType::EIndexTypeGlobalJsonCompact:
+            return type;
+        case EIndexType::EIndexTypeInvalid:
+        case EIndexType::EIndexTypeLocalBloomFilter:
+        case EIndexType::EIndexTypeLocalBloomNgramFilter:
+        case EIndexType::EIndexTypeLocalMinMax:
+        case EIndexType::EIndexTypeLocalCountMinSketch:
+            error = TStringBuilder() << "unsupported internal index build type "
+                << request.GetInternalIndexType();
+            return Nothing();
+    }
+
+    error = TStringBuilder() << "unknown internal index build type "
+        << request.GetInternalIndexType();
+    return Nothing();
+}
+
+bool IsCompatibleInternalIndexType(
+    Ydb::Table::TableIndex::TypeCase publicType,
+    EIndexType internalType)
+{
+    switch (publicType) {
+        case Ydb::Table::TableIndex::kGlobalIndex:
+            return internalType == EIndexType::EIndexTypeGlobal;
+        case Ydb::Table::TableIndex::kGlobalAsyncIndex:
+            return internalType == EIndexType::EIndexTypeGlobalAsync;
+        case Ydb::Table::TableIndex::kGlobalUniqueIndex:
+            return internalType == EIndexType::EIndexTypeGlobalUnique;
+        case Ydb::Table::TableIndex::kGlobalVectorKmeansTreeIndex:
+            return internalType == EIndexType::EIndexTypeGlobalVectorKmeansTree;
+        case Ydb::Table::TableIndex::kGlobalFulltextPlainIndex:
+            return IsIn({
+                EIndexType::EIndexTypeGlobalFulltextPlain,
+                EIndexType::EIndexTypeGlobalFulltextCompact,
+            }, internalType);
+        case Ydb::Table::TableIndex::kGlobalFulltextRelevanceIndex:
+            return IsIn({
+                EIndexType::EIndexTypeGlobalFulltextRelevance,
+                EIndexType::EIndexTypeGlobalFulltextCompactRelevance,
+            }, internalType);
+        case Ydb::Table::TableIndex::kGlobalJsonIndex:
+            return IsIn({
+                EIndexType::EIndexTypeGlobalJson,
+                EIndexType::EIndexTypeGlobalJsonCompact,
+            }, internalType);
+        case Ydb::Table::TableIndex::kLocalBloomFilterIndex:
+        case Ydb::Table::TableIndex::kLocalBloomNgramFilterIndex:
+        case Ydb::Table::TableIndex::kLocalMinMaxIndex:
+        case Ydb::Table::TableIndex::TYPE_NOT_SET:
+            return false;
+    }
+    return false;
+}
+
+bool ApplyInternalIndexType(
+    TIndexBuildInfo& buildInfo,
+    const Ydb::Table::TableIndex& publicIndex,
+    EIndexType internalType,
+    TString& error)
+{
+    if (!IsCompatibleInternalIndexType(publicIndex.type_case(), internalType)) {
+        error = TStringBuilder()
+            << "public index kind is incompatible with internal type "
+            << static_cast<ui32>(internalType);
+        return false;
+    }
+
+    // The public relevance-index shape always has a dictionary-table slot,
+    // while the compact internal implementation intentionally has none. The
+    // SQL adapter leaves that public-only slot empty; remove it before the
+    // exact internal topology is persisted and proposed.
+    if (internalType == EIndexType::EIndexTypeGlobalFulltextCompactRelevance) {
+        const auto& dictSettings =
+            publicIndex.global_fulltext_relevance_index().dict_table_settings();
+        if (dictSettings.ByteSizeLong() != 0) {
+            error = "compact relevance index cannot have dictionary-table settings";
+            return false;
+        }
+        if (buildInfo.ImplTableDescriptions.size() != 4) {
+            error = TStringBuilder()
+                << "compact relevance index expects the four-slot public settings layout, got "
+                << buildInfo.ImplTableDescriptions.size();
+            return false;
+        }
+        buildInfo.ImplTableDescriptions.erase(buildInfo.ImplTableDescriptions.begin());
+    }
+
+    buildInfo.IndexType = internalType;
+    const auto expectedImplTables = NTableIndex::GetImplTables(
+        internalType,
+        std::span<const TString>(buildInfo.IndexColumns.data(), buildInfo.IndexColumns.size()));
+    if (buildInfo.ImplTableDescriptions.size() != expectedImplTables.size()) {
+        error = TStringBuilder()
+            << "internal index type " << static_cast<ui32>(internalType)
+            << " expects " << expectedImplTables.size()
+            << " implementation tables, got " << buildInfo.ImplTableDescriptions.size();
+        return false;
+    }
+
+    return true;
+}
+
+} // anonymous namespace
 
 class TSchemeShard::TIndexBuilder::TTxCreate: public TSchemeShard::TIndexBuilder::TTxSimple<TEvIndexBuilder::TEvCreateRequest, TEvIndexBuilder::TEvCreateResponse> {
 public:
@@ -31,6 +162,12 @@ public:
         );
 
         Response = MakeHolder<TEvIndexBuilder::TEvCreateResponse>(request.GetTxId());
+
+        TString internalIndexTypeError;
+        const auto internalIndexType = ParseInternalIndexType(request, internalIndexTypeError);
+        if (request.HasInternalIndexType() && !internalIndexType) {
+            return Reply(Ydb::StatusIds::BAD_REQUEST, internalIndexTypeError);
+        }
 
         if (Self->IndexBuilds.contains(BuildId)) {
             return Reply(Ydb::StatusIds::ALREADY_EXISTS, TStringBuilder()
@@ -185,6 +322,12 @@ public:
             TString explain;
             if (!Prepare(*buildInfo, settings, tableInfo, explain)) {
                 return makeReply(explain);
+            }
+            if (internalIndexType) {
+                if (!ApplyInternalIndexType(
+                        *buildInfo, settings.index(), *internalIndexType, explain)) {
+                    return makeReply(explain);
+                }
             }
 
             if (tableInfo->IsTTLEnabled() && !DoesIndexSupportTTL(buildInfo->IndexType)) {

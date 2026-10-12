@@ -84,6 +84,10 @@ message TEvCreateRequest {
     // Internal flag is true for system-generated operations and is false for those initiated directly by the user.
     optional bool Internal = 5 [default = false];
     optional string UserSID = 6;
+    // Exact internal type for system-owned restores. Public API index kinds
+    // intentionally collapse compact and non-compact implementations, so an
+    // import must carry the durable type selected by the SQL schema plan.
+    optional uint32 InternalIndexType = 7;
 }
 
 message TEvCreateResponse {

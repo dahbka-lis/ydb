@@ -52,18 +52,51 @@ struct TSchemeShard::TImport::TTxCancel: public TSchemeShard::TXxport::TTxBase {
         switch (importInfo->State) {
         case TImportInfo::EState::Done:
         case TImportInfo::EState::Cancelled:
+        case TImportInfo::EState::Cancellation:
             return respond(Ydb::StatusIds::SUCCESS);
 
         case TImportInfo::EState::DownloadExportMetadata:
         case TImportInfo::EState::Waiting:
-        case TImportInfo::EState::Cancellation:
             importInfo->Issue = "Cancelled manually";
             importInfo->State = TImportInfo::EState::Cancelled;
 
+            if (importInfo->SchemaMappingGetter) {
+                const auto actor = importInfo->SchemaMappingGetter;
+                importInfo->SchemaMappingGetter = {};
+                Send(actor, new TEvents::TEvPoisonPill());
+                Self->RunningImportSchemeGetters.erase(actor);
+            }
+
             for (ui32 itemIdx : xrange(importInfo->Items.size())) {
-                const auto& item = importInfo->Items.at(itemIdx);
+                auto& item = importInfo->Items.at(itemIdx);
+
+                if (item.SchemeGetter) {
+                    const auto actor = item.SchemeGetter;
+                    item.SchemeGetter = {};
+                    Send(actor, new TEvents::TEvPoisonPill());
+                    Self->RunningImportSchemeGetters.erase(actor);
+                }
+                if (item.SchemeQueryExecutor) {
+                    const auto actor = item.SchemeQueryExecutor;
+                    item.SchemeQueryExecutor = {};
+                    Send(actor, new TEvents::TEvPoisonPill());
+                    Self->RunningImportSchemeQueryExecutors.erase(actor);
+                }
 
                 switch (item.State) {
+                case TImportInfo::EState::CreateSchemeObject:
+                case TImportInfo::EState::CreateChangefeed:
+                    // Generic scheme transactions are not cancellable. Keep
+                    // the import non-terminal until their proposal/result and
+                    // completion notification have been observed, otherwise a
+                    // following Forget could remove the durable ownership
+                    // fence while DDL is still in flight.
+                    if (item.WaitTxId != InvalidTxId
+                        || item.SubState == TImportInfo::TItem::ESubState::Proposed) {
+                        importInfo->State = TImportInfo::EState::Cancellation;
+                    }
+                    break;
+
                 case TImportInfo::EState::Transferring:
                     if (item.WaitTxId != InvalidTxId) {
                         importInfo->State = TImportInfo::EState::Cancellation;
@@ -150,8 +183,6 @@ struct TSchemeShard::TImport::TTxCancelAck: public TSchemeShard::TXxport::TTxBas
 
         bool found = false;
         ui32 itemIdx;
-        ui32 cancelledItems = 0;
-        ui32 cancellableItems = 0;
 
         for (ui32 i : xrange(importInfo->Items.size())) {
             auto& item = importInfo->Items.at(i);
@@ -160,19 +191,13 @@ struct TSchemeShard::TImport::TTxCancelAck: public TSchemeShard::TXxport::TTxBas
                 continue;
             }
 
-            if (item.WaitTxId != InvalidTxId) {
-                ++cancellableItems;
-            }
-
             if (item.WaitTxId == TxId) {
                 found = true;
 
                 item.State = TImportInfo::EState::Cancelled;
+                item.SubState = TImportInfo::TItem::ESubState::AllocateTxId;
+                item.WaitTxId = InvalidTxId;
                 itemIdx = i;
-            }
-
-            if (item.State == TImportInfo::EState::Cancelled) {
-                ++cancelledItems;
             }
         }
 
@@ -183,7 +208,7 @@ struct TSchemeShard::TImport::TTxCancelAck: public TSchemeShard::TXxport::TTxBas
         Self->TxIdToImport.erase(TxId);
         Self->PersistImportItemState(db, *importInfo, itemIdx);
 
-        if (cancelledItems != cancellableItems) {
+        if (importInfo->HasPendingCancellationWork()) {
             return true;
         }
 

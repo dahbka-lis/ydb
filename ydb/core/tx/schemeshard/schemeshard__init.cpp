@@ -5379,6 +5379,15 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                         item.PreparedCreationQuery = std::move(preparedQuery);
                     }
 
+                    if (rowset.HaveValue<Schema::ImportItems::TableSchemaPlan>()) {
+                        NKikimrImport::TTableSchemaImportPlan tableSchemaPlan;
+                        Y_ABORT_UNLESS(ParseFromStringNoSizeLimit(
+                            tableSchemaPlan,
+                            rowset.GetValue<Schema::ImportItems::TableSchemaPlan>()
+                        ));
+                        item.TableSchemaPlan = std::move(tableSchemaPlan);
+                    }
+
                     if (rowset.HaveValue<Schema::ImportItems::Permissions>()) {
                         Ydb::Scheme::ModifyPermissionsRequest permissions;
                         Y_ABORT_UNLESS(ParseFromStringNoSizeLimit(permissions, rowset.GetValue<Schema::ImportItems::Permissions>()));
@@ -5405,10 +5414,22 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                         item.SysView = sysView;
                     }
 
+                    // A legacy row with a table description always resumes through the
+                    // protobuf path, even if stale query fields happen to be present.
+                    if (item.Table && !item.TableSchemaPlan) {
+                        item.CreationQuery.clear();
+                        item.PreparedCreationQuery.Clear();
+                    }
+
                     item.State = static_cast<TImportInfo::EState>(rowset.GetValue<Schema::ImportItems::State>());
                     item.WaitTxId = rowset.GetValueOrDefault<Schema::ImportItems::WaitTxId>(InvalidTxId);
                     item.NextIndexIdx = rowset.GetValueOrDefault<Schema::ImportItems::NextIndexIdx>(0);
                     item.NextChangefeedIdx = rowset.GetValueOrDefault<Schema::ImportItems::NextChangefeedIdx>(0);
+                    if (item.UsesSqlSchema() && item.State == TImportInfo::EState::CreateChangefeed) {
+                        // SQL has already created every stream/topic. This phase
+                        // only consumes legacy sidecars to restore consumers.
+                        item.ChangefeedState = TImportInfo::TItem::EChangefeedState::CreateConsumers;
+                    }
                     item.Issue = rowset.GetValueOrDefault<Schema::ImportItems::Issue>(TString());
                     item.SrcPrefix = rowset.GetValueOrDefault<Schema::ImportItems::SrcPrefix>(TString());
                     item.SrcPath = rowset.GetValueOrDefault<Schema::ImportItems::SrcPath>(TString());

@@ -26,6 +26,7 @@
 #include <ydb/library/aws_init/aws.h>
 #include <ydb/library/testlib/backup_test_enums/backup_test_enums.h>
 #include <ydb/library/testlib/parquet_helpers/parquet_helpers.h>
+#include <ydb/public/lib/value/value.h>
 
 #include <yql/essentials/public/udf/udf_data_type.h>
 #include <yql/essentials/types/binary_json/write.h>
@@ -218,6 +219,7 @@ namespace {
         TDataWithChecksum Metadata = R"({"version": 0})";
         EPathType Type = EPathTypeTable;
         TDataWithChecksum Scheme;
+        TMaybe<TDataWithChecksum> TableCreationQuery;
         TDataWithChecksum CreationQuery;
         TDataWithChecksum SysViewDescription;
         TDataWithChecksum Permissions;
@@ -432,6 +434,15 @@ namespace {
                 result.emplace(schemeKey, item.Scheme);
                 if (withChecksum) {
                     result.emplace(NBackup::ChecksumKey(schemeKey), item.Scheme.Checksum);
+                }
+                if (item.TableCreationQuery.Defined()) {
+                    const auto createTableKey = prefix + "/" + NYdb::NDump::NFiles::CreateTable().FileName;
+                    result.emplace(createTableKey, *item.TableCreationQuery);
+                    if (withChecksum) {
+                        result.emplace(
+                            NBackup::ChecksumKey(createTableKey),
+                            item.TableCreationQuery->Checksum);
+                    }
                 }
                 break;
             }
@@ -4127,6 +4138,150 @@ Y_UNIT_TEST_SUITE(TImportTests) {
             }
             primary_key: "key"
         )";
+    }
+
+    const NKikimrSchemeOp::TColumnDescription* FindColumn(
+            const NKikimrScheme::TEvDescribeSchemeResult& describe,
+            TStringBuf name) {
+        UNIT_ASSERT(describe.HasPathDescription());
+        UNIT_ASSERT(describe.GetPathDescription().HasTable());
+        for (const auto& column : describe.GetPathDescription().GetTable().GetColumns()) {
+            if (column.GetName() == name) {
+                return &column;
+            }
+        }
+        return nullptr;
+    }
+
+    bool HasColumn(const NKikimrScheme::TEvDescribeSchemeResult& describe, TStringBuf name) {
+        return FindColumn(describe, name) != nullptr;
+    }
+
+    Y_UNIT_TEST(SqlTablePreferredOverProto) {
+        TTestBasicRuntime runtime;
+        auto backup = GenerateTestData(Utf8KeyValueScheme(), {{"a", 1}});
+        backup.TableCreationQuery.ConstructInPlace(TString(R"sql(
+            CREATE TABLE `OriginalTable` (
+                `key` Utf8 NOT NULL,
+                `value` Utf8,
+                `sql_only` Uint64,
+                PRIMARY KEY (`key`)
+            );
+        )sql"));
+
+        const ui64 id = Run(
+            runtime, ConvertTestData(backup), ImportTableRequest(),
+            /*enableDirectPartImport=*/false);
+
+        const auto describe = DescribePath(runtime, "/MyRoot/Table");
+        UNIT_ASSERT_C(HasColumn(describe, "sql_only"), describe.ShortDebugString());
+        UNIT_ASSERT(!ImportIssues(runtime, id, Ydb::StatusIds::SUCCESS).Contains("table SQL was not used"));
+
+        const auto content = ReadTable(
+            runtime, TTestTxConfig::FakeHiveTablets, "Table", {"key"}, {"key", "value"});
+        NKqp::CompareYson(backup.Data[0].YsonStr, content);
+    }
+
+    Y_UNIT_TEST(SqlTableInvalidUsesProto) {
+        TTestBasicRuntime runtime;
+        auto backup = GenerateTestData(Utf8KeyValueScheme(), {{"a", 1}});
+        backup.TableCreationQuery.ConstructInPlace(TString("CREATE TABLE this is not valid SQL;"));
+
+        const ui64 id = Run(
+            runtime, ConvertTestData(backup), ImportTableRequest(),
+            /*enableDirectPartImport=*/false);
+
+        const auto describe = DescribePath(runtime, "/MyRoot/Table");
+        UNIT_ASSERT(!HasColumn(describe, "sql_only"));
+        UNIT_ASSERT_STRING_CONTAINS(
+            ImportIssues(runtime, id, Ydb::StatusIds::SUCCESS),
+            "table SQL was not used");
+    }
+
+    Y_UNIT_TEST(SqlTableEmptyUsesProto) {
+        TTestBasicRuntime runtime;
+        auto backup = GenerateTestData(Utf8KeyValueScheme(), {{"a", 1}});
+        backup.TableCreationQuery.ConstructInPlace(TString());
+
+        const ui64 id = Run(
+            runtime, ConvertTestData(backup), ImportTableRequest(),
+            /*enableDirectPartImport=*/false);
+
+        TestDescribeResult(DescribePath(runtime, "/MyRoot/Table"), {
+            NLs::PathExist,
+            NLs::IsTable,
+        });
+        UNIT_ASSERT_STRING_CONTAINS(
+            ImportIssues(runtime, id, Ydb::StatusIds::SUCCESS),
+            "table backup SQL is empty");
+    }
+
+    Y_UNIT_TEST_FLAG(SqlTablePreservesGeneratedStoredAndVirtual, EnableDataShardDirectPartImport) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime, TTestEnvOptions().SetupKqpProxy(true));
+        runtime.GetAppData().FeatureFlags.SetEnableDataShardDirectPartImport(
+            EnableDataShardDirectPartImport);
+        runtime.GetAppData().FeatureFlags.SetEnableGeneratedStored(true);
+        runtime.GetAppData().FeatureFlags.SetEnableGeneratedVirtual(true);
+
+        TTestDataWithScheme backup(R"(
+            columns {
+              name: "key"
+              type { optional_type { item { type_id: INT32 } } }
+            }
+            columns {
+              name: "a"
+              type { optional_type { item { type_id: INT32 } } }
+            }
+            columns {
+              name: "stored"
+              type { optional_type { item { type_id: INT32 } } }
+            }
+            primary_key: "key"
+        )", {
+            TTestData("1,2,99\n", EmptyYsonStr)
+        });
+        backup.TableCreationQuery.ConstructInPlace(TString(R"sql(
+            CREATE TABLE `OriginalTable` (
+                `key` Int32 NOT NULL,
+                `a` Int32,
+                `stored` Int32 GENERATED ALWAYS AS (COALESCE(a, 0) + 1) STORED,
+                `virtual` Int32 GENERATED ALWAYS AS (COALESCE(a, 0) + 2) VIRTUAL,
+                PRIMARY KEY (`key`)
+            );
+        )sql"));
+
+        Run(runtime, env, ConvertTestData(backup), ImportTableRequest());
+
+        const auto describe = DescribePath(runtime, "/MyRoot/Table");
+        const auto* stored = FindColumn(describe, "stored");
+        const auto* virtualColumn = FindColumn(describe, "virtual");
+        UNIT_ASSERT_C(stored && stored->HasDefaultFromExpression(),
+            describe.ShortDebugString());
+        const auto& storedExpression = stored->GetDefaultFromExpression();
+        UNIT_ASSERT(storedExpression.GetStored());
+        UNIT_ASSERT_VALUES_EQUAL(storedExpression.GetExprText(), "COALESCE(a, 0) + 1");
+        UNIT_ASSERT_VALUES_EQUAL(storedExpression.DependencyColumnNamesSize(), 1u);
+        UNIT_ASSERT_VALUES_EQUAL(storedExpression.GetDependencyColumnNames(0), "a");
+        UNIT_ASSERT_C(virtualColumn && virtualColumn->HasDefaultFromExpression(),
+            describe.ShortDebugString());
+        const auto& virtualExpression = virtualColumn->GetDefaultFromExpression();
+        UNIT_ASSERT(!virtualExpression.GetStored());
+        UNIT_ASSERT_VALUES_EQUAL(virtualExpression.GetExprText(), "COALESCE(a, 0) + 2");
+        UNIT_ASSERT_VALUES_EQUAL(virtualExpression.DependencyColumnNamesSize(), 1u);
+        UNIT_ASSERT_VALUES_EQUAL(virtualExpression.GetDependencyColumnNames(0), "a");
+
+        // The backup deliberately stores 99 although the current expression
+        // evaluates to 3. Raw restore must preserve the physical STORED cell;
+        // VIRTUAL is absent from the protobuf/data layout and is not written.
+        const auto content = ReadTable(
+            runtime, TTestTxConfig::FakeHiveTablets, "Table", {"key"},
+            {"key", "a", "stored"});
+        const auto rows = NClient::TValue::Create(content)["Result"]["List"];
+        UNIT_ASSERT_VALUES_EQUAL(rows.Size(), 1u);
+        UNIT_ASSERT_VALUES_EQUAL(static_cast<i32>(rows[0]["key"]), 1);
+        UNIT_ASSERT_VALUES_EQUAL(static_cast<i32>(rows[0]["a"]), 2);
+        UNIT_ASSERT_VALUES_EQUAL(static_cast<i32>(rows[0]["stored"]), 99);
     }
 
     Y_UNIT_TEST_FLAG(ShouldSucceedOnParquetTable, EnableDataShardDirectPartImport) {
@@ -9781,6 +9936,66 @@ Y_UNIT_TEST_SUITE(TImportWithRebootsTests) {
             }
             primary_key: "key"
         )", EnableDataShardDirectPartImport);
+    }
+
+    Y_UNIT_TEST_WITH_REBOOTS_BUCKETS_QUAD(ShouldSucceedOnSqlFirstTable, 2, 1, false, IsFs, EnableDataShardDirectPartImport) {
+        auto data = GenerateTestData(R"(
+            columns {
+              name: "key"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            columns {
+              name: "value"
+              type { optional_type { item { type_id: UTF8 } } }
+            }
+            primary_key: "key"
+        )", {{"a", 1}});
+        data.TableCreationQuery.ConstructInPlace(TString(R"sql(
+            CREATE TABLE `OriginalTable` (
+                `key` Utf8 NOT NULL,
+                `value` Utf8,
+                `sql_only` Uint64,
+                PRIMARY KEY (`key`)
+            );
+        )sql"));
+        TImportEnv<IsFs> env(ConvertTestData(data), DefaultImportItems());
+
+        t.GetTestEnvOptions().RunFakeConfigDispatcher(true);
+        t.GetTestEnvOptions().SetupKqpProxy(true);
+        t.GetTestEnvOptions().InitYdbDriver(true);
+        t.Run([&](TTestActorRuntime& runtime, bool& activeZone) {
+            {
+                TInactiveZone inactive(activeZone);
+                env.SetupRuntime(runtime);
+                runtime.SetLogPriority(NKikimrServices::DATASHARD_RESTORE, NActors::NLog::PRI_TRACE);
+                runtime.SetLogPriority(NKikimrServices::IMPORT, NActors::NLog::PRI_TRACE);
+                runtime.GetAppData().FeatureFlags.SetEnableDataShardDirectPartImport(
+                    EnableDataShardDirectPartImport);
+            }
+
+            const ui64 importId = ++t.TxId;
+            AsyncImport(runtime, importId, "/MyRoot", env.Request);
+            t.TestEnv->TestWaitNotification(runtime, importId);
+
+            {
+                TInactiveZone inactive(activeZone);
+                TestGetImport(runtime, importId, "/MyRoot", {
+                    Ydb::StatusIds::SUCCESS,
+                    Ydb::StatusIds::NOT_FOUND
+                });
+                const auto describe = DescribePath(runtime, "/MyRoot/Table");
+                UNIT_ASSERT(AnyOf(
+                    describe.GetPathDescription().GetTable().GetColumns(),
+                    [](const auto& column) { return column.GetName() == "sql_only"; }));
+                const auto content = ReadTable(
+                    runtime,
+                    TTestTxConfig::FakeHiveTablets,
+                    "Table",
+                    {"key"},
+                    {"key", "value"});
+                NKqp::CompareYson(data.Data[0].YsonStr, content);
+            }
+        });
     }
 
     Y_UNIT_TEST_WITH_REBOOTS_BUCKETS_TWIN(ShouldSucceedOnParquetTable, 2, 1, false, EnableDataShardDirectPartImport) {

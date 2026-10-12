@@ -1,6 +1,7 @@
 #include "schemeshard_import_getters.h"
 
 #include "schemeshard_import_helpers.h"
+#include "schemeshard_import_table_scheme.h"
 #include "schemeshard_private.h"
 #include "schemeshard_xxport__helpers.h"
 
@@ -19,6 +20,8 @@
 #include <ydb/library/backup/proto/proto.h>
 #include <ydb/public/api/protos/ydb_import.pb.h>
 #include <ydb/public/lib/ydb_cli/dump/files/files.h>
+
+#include <yql/essentials/public/issue/yql_issue.h>
 
 #include <library/cpp/json/json_reader.h>
 
@@ -108,6 +111,13 @@ protected:
     }
 
     void GetObject(const TString& key, ui64 contentLength, bool autoAddEncSuffix = true) {
+        if (!contentLength) {
+            CurrentRequestKey = GetKey(key, autoAddEncSuffix);
+            auto request = Model::GetObjectRequest()
+                .WithKey(CurrentRequestKey);
+            this->Send(Client, new TEvExternalStorage::TEvGetObjectRequest(request));
+            return;
+        }
         GetObject(key, std::make_pair(0, contentLength - 1), autoAddEncSuffix);
     }
 
@@ -310,6 +320,12 @@ protected:
 
 // Downloads scheme-related objects from S3
 class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
+    enum class ESchemeCandidate {
+        TableSql,
+        LegacyDiscovery,
+        RequiredTableProtobuf,
+    };
+
     static TString GetItemSource(const TImportInfo& importInfo, ui32 itemIdx) {
         TString srcPrefix = importInfo.GetItemSrcPrefix(itemIdx);
 
@@ -373,6 +389,30 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
             ChangefeedsPrefixes[IndexDownloadedChangefeed]);
     }
 
+    void AdvanceToNextChangefeed() {
+        if (++IndexDownloadedChangefeed >= ChangefeedsPrefixes.size()) {
+            Reply();
+        } else {
+            ResetRetries();
+            Become(&TThis::StateDownloadChangefeeds);
+            HeadObject(CurrentChangefeedDescriptionKey());
+        }
+    }
+
+    void SkipCurrentSqlChangefeed() {
+        AdvanceToNextChangefeed();
+    }
+
+    void AdvanceToNextMaterializedIndex() {
+        if (++IndexCheckedMaterializedIndexImplTable >= IndexImplTablePrefixes.size()) {
+            StartDownloadingChangefeeds();
+        } else {
+            ResetRetries();
+            Become(&TThis::StateCheckIndexes);
+            HeadObject(CurrentMaterializedIndexSchemeKey());
+        }
+    }
+
     static bool IsView(TStringBuf schemeKey) {
         return schemeKey.EndsWith(NYdb::NDump::NFiles::CreateView().FileName);
     }
@@ -415,6 +455,32 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
 
     static bool NoObjectFound(Aws::S3::S3Errors errorType) {
         return errorType == S3Errors::RESOURCE_NOT_FOUND || errorType == S3Errors::NO_SUCH_KEY;
+    }
+
+    void StartLegacySchemeDiscovery() {
+        Candidate = ESchemeCandidate::LegacyDiscovery;
+        SchemePropertiesIdx = 0;
+        SchemeKey = TableProtobufKey;
+        SchemeFileType = NBackup::EBackupFileType::TableSchema;
+        ResetRetries();
+        DownloadScheme();
+        Become(&TThis::StateDownloadScheme);
+    }
+
+    void StartRequiredTableProtobuf() {
+        Candidate = ESchemeCandidate::RequiredTableProtobuf;
+        SchemeKey = TableProtobufKey;
+        SchemeFileType = NBackup::EBackupFileType::TableSchema;
+        ResetRetries();
+        DownloadScheme();
+        Become(&TThis::StateDownloadScheme);
+    }
+
+    void SelectProtobufFallback(TString reason) {
+        Y_ABORT_UNLESS(ItemIdx < ImportInfo->Items.size());
+        auto& item = ImportInfo->Items.at(ItemIdx);
+        item.ResetToProtobufSchema(std::move(reason));
+        StartRequiredTableProtobuf();
     }
 
     void HandleMetadata(TEvExternalStorage::TEvHeadObjectResponse::TPtr& ev) {
@@ -485,8 +551,16 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
             {"result", result},
         );
 
-        if (NoObjectFound(result.GetError().GetErrorType())) {
-            HeadNextScheme();
+        if (IsNoSuchKeyError(result)) {
+            if (Candidate == ESchemeCandidate::TableSql) {
+                StartLegacySchemeDiscovery();
+            } else if (Candidate == ESchemeCandidate::RequiredTableProtobuf) {
+                Reply(Ydb::StatusIds::BAD_REQUEST,
+                    TStringBuilder() << TableProtobufKey
+                        << ": required table data-layout artifact is missing");
+            } else {
+                HeadNextScheme();
+            }
             return;
         }
 
@@ -494,7 +568,16 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
             return;
         }
 
-        GetObject(SchemeKey, result.GetResult().GetContentLength());
+        const ui64 contentLength = result.GetResult().GetContentLength();
+        if (!contentLength) {
+            TString content;
+            if (!MaybeDecrypt({}, content, SchemeFileType)) {
+                return;
+            }
+            return ValidateAndProcessSchemeContent(std::move(content));
+        }
+
+        GetObject(SchemeKey, contentLength);
     }
 
     void HandlePermissions(TEvExternalStorage::TEvHeadObjectResponse::TPtr& ev) {
@@ -531,10 +614,13 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
         );
 
         const bool canSkip = IndexPopulationMode != Ydb::Import::ImportFromS3Settings::INDEX_POPULATION_MODE_IMPORT;
+        const auto& item = ImportInfo->Items.at(ItemIdx);
+        if (item.UsesSqlSchema() && IsNoSuchKeyError(result)) {
+            return AdvanceToNextMaterializedIndex();
+        }
         if (canSkip && NoObjectFound(result.GetError().GetErrorType())) {
             Y_ABORT_UNLESS(ItemIdx < ImportInfo->Items.size());
-            auto& item = ImportInfo->Items.at(ItemIdx);
-            item.MaterializedIndexes.clear();
+            ImportInfo->Items.at(ItemIdx).MaterializedIndexes.clear();
             return StartDownloadingChangefeeds();
         } else if (!CheckResult(result, "HeadObject")) {
             return;
@@ -551,6 +637,9 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
             {"result", result},
         );
 
+        if (ImportInfo->Items.at(ItemIdx).UsesSqlSchema() && IsNoSuchKeyError(result)) {
+            return SkipCurrentSqlChangefeed();
+        }
         if (!CheckResult(result, "HeadObject")) {
             return;
         }
@@ -566,6 +655,9 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
             {"result", result},
         );
 
+        if (ImportInfo->Items.at(ItemIdx).UsesSqlSchema() && IsNoSuchKeyError(result)) {
+            return SkipCurrentSqlChangefeed();
+        }
         if (!CheckResult(result, "HeadObject")) {
             return;
         }
@@ -632,6 +724,10 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
             {"result", result},
         );
 
+        if (Candidate == ESchemeCandidate::TableSql && IsNoSuchKeyError(result)) {
+            return SelectProtobufFallback(TStringBuilder()
+                << SchemeKey << ": disappeared after successful discovery");
+        }
         if (!CheckResult(result, "GetObject")) {
             return;
         }
@@ -641,8 +737,41 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
             return;
         }
 
+        ValidateAndProcessSchemeContent(std::move(content));
+    }
+
+    void ValidateAndProcessSchemeContent(TString content) {
+        // Checksum validation and the continuation both need the plaintext.
+        // Keep a separate continuation copy so argument evaluation order cannot
+        // make StartValidatingChecksum observe a moved-from string.
+        auto nextStep = [this, content]() {
+            ProcessSchemeContent(content);
+        };
+
+        if (NeedValidateChecksums) {
+            StartValidatingChecksum(SchemeKey, content, std::move(nextStep));
+        } else {
+            nextStep();
+        }
+    }
+
+    void ProcessSchemeContent(const TString& content) {
         Y_ABORT_UNLESS(ItemIdx < ImportInfo->Items.size());
         auto& item = ImportInfo->Items.at(ItemIdx);
+
+        if (Candidate == ESchemeCandidate::TableSql) {
+            NKikimrImport::TTableSchemaImportPlan plan;
+            NYql::TIssues issues;
+            if (!PrepareTableImportSql(content, Database, item.DstPathName, plan, issues)) {
+                return SelectProtobufFallback(TStringBuilder()
+                    << SchemeKey << ": " << issues.ToOneLineString());
+            }
+
+            plan.SetPreparationAttempt(1);
+            item.TableSchemaPlan = std::move(plan);
+            item.CreationQuery = item.TableSchemaPlan->GetRewrittenScript();
+            return StartRequiredTableProtobuf();
+        }
 
         YDB_LOG_TRACE("Trying to parse scheme",
             {"self", SelfId()},
@@ -672,6 +801,12 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
                 return Reply(Ydb::StatusIds::BAD_REQUEST, TStringBuilder() << SchemeKey << ": cannot parse scheme");
             }
             item.Table = request;
+            if (!item.TableSchemaPlan) {
+                NKikimrImport::TTableSchemaImportPlan plan;
+                plan.SetFormatVersion(1);
+                plan.SetSource(NKikimrImport::TTableSchemaImportPlan::SCHEMA_SOURCE_PROTOBUF);
+                item.TableSchemaPlan = std::move(plan);
+            }
         } else {
             return Reply(Ydb::StatusIds::BAD_REQUEST,
                 TStringBuilder() << SchemeKey << ": unsupported scheme object type");
@@ -684,12 +819,7 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
                 StartCheckingMaterializedIndexes();
             }
         };
-
-        if (NeedValidateChecksums) {
-            StartValidatingChecksum(SchemeKey, content, nextStep);
-        } else {
-            nextStep();
-        }
+        nextStep();
     }
 
     void HandlePermissions(TEvExternalStorage::TEvGetObjectResponse::TPtr& ev) {
@@ -745,6 +875,9 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
             {"result", result},
         );
 
+        if (ImportInfo->Items.at(ItemIdx).UsesSqlSchema() && IsNoSuchKeyError(result)) {
+            return AdvanceToNextMaterializedIndex();
+        }
         if (!CheckResult(result, "GetObject")) {
             return;
         }
@@ -773,12 +906,7 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
         item.MaterializedIndexes.emplace_back(indexImplTablePrefix, std::move(request));
 
         auto nextStep = [this]() {
-            if (++IndexCheckedMaterializedIndexImplTable >= IndexImplTablePrefixes.size()) {
-                StartDownloadingChangefeeds();
-            } else {
-                Become(&TThis::StateCheckIndexes);
-                HeadObject(CurrentMaterializedIndexSchemeKey());
-            }
+            AdvanceToNextMaterializedIndex();
         };
 
         if (NeedValidateChecksums) {
@@ -797,6 +925,9 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
             {"result", result},
         );
 
+        if (ImportInfo->Items.at(ItemIdx).UsesSqlSchema() && IsNoSuchKeyError(result)) {
+            return SkipCurrentSqlChangefeed();
+        }
         if (!CheckResult(result, "GetObject")) {
             return;
         }
@@ -823,6 +954,7 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
         *item.Changefeeds.MutableChangefeeds(IndexDownloadedChangefeed)->MutableChangefeed() = std::move(changefeed);
 
         auto nextStep = [this]() {
+            ResetRetries();
             Become(&TThis::StateDownloadTopics);
             HeadObject(CurrentTopicDescriptionKey());
         };
@@ -843,6 +975,9 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
             {"result", result},
         );
 
+        if (ImportInfo->Items.at(ItemIdx).UsesSqlSchema() && IsNoSuchKeyError(result)) {
+            return SkipCurrentSqlChangefeed();
+        }
         if (!CheckResult(result, "GetObject")) {
             return;
         }
@@ -868,12 +1003,7 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
         *item.Changefeeds.MutableChangefeeds(IndexDownloadedChangefeed)->MutableTopic() = std::move(topic);
 
         auto nextStep = [this]() {
-            if (++IndexDownloadedChangefeed >= ChangefeedsPrefixes.size()) {
-                Reply();
-            } else {
-                Become(&TThis::StateDownloadChangefeeds);
-                HeadObject(CurrentChangefeedDescriptionKey());
-            }
+            AdvanceToNextChangefeed();
         };
 
         if (NeedValidateChecksums) {
@@ -901,12 +1031,16 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
 
         const auto& objects = result.GetResult().GetContents();
         ChangefeedsPrefixes.clear();
+        ChangefeedsNames.clear();
         ChangefeedsPrefixes.reserve(objects.size());
+        ChangefeedsNames.reserve(objects.size());
 
         for (const auto& obj : objects) {
             const TFsPath path = obj.GetKey();
             if (path.GetName() == "changefeed_description.pb") {
-                ChangefeedsPrefixes.push_back(path.Parent().GetName());
+                const TString name = path.Parent().GetName();
+                ChangefeedsPrefixes.push_back(name);
+                ChangefeedsNames.push_back(name);
             }
         }
 
@@ -1008,11 +1142,24 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
 
     void DownloadChangefeeds() {
         Become(&TThis::StateDownloadChangefeeds);
+        if (ChangefeedsInitialized) {
+            // Freeze the first successful listing. Retrying by listing again
+            // could resize or reorder slots after some sidecars were already
+            // downloaded, corrupting the association between a stream and its
+            // descriptions.
+            HeadObject(CurrentChangefeedDescriptionKey());
+            return;
+        }
+
         if (const auto& maybeChangefeeds = ImportInfo->Items[ItemIdx].Metadata.GetChangefeeds()) {
             ChangefeedsPrefixes.clear();
+            ChangefeedsNames.clear();
             ChangefeedsPrefixes.reserve(maybeChangefeeds->size());
+            ChangefeedsNames.reserve(maybeChangefeeds->size());
             for (const auto& changefeed : *maybeChangefeeds) {
                 ChangefeedsPrefixes.push_back(changefeed.ExportPrefix);
+                ChangefeedsNames.push_back(
+                    changefeed.Name.empty() ? changefeed.ExportPrefix : changefeed.Name);
             }
 
             DownloadChangefeedsData();
@@ -1028,8 +1175,21 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
 
     void DownloadChangefeedsData() {
         if (!ChangefeedsPrefixes.empty()) {
+            Y_ABORT_UNLESS(ChangefeedsPrefixes.size() == ChangefeedsNames.size());
             auto& item = ImportInfo->Items.at(ItemIdx);
-            Resize(item.Changefeeds.MutableChangefeeds(), ChangefeedsPrefixes.size());
+            if (!ChangefeedsInitialized) {
+                item.Changefeeds.ClearChangefeeds();
+                Resize(item.Changefeeds.MutableChangefeeds(), ChangefeedsPrefixes.size());
+                for (ui64 index = 0; index < ChangefeedsNames.size(); ++index) {
+                    item.Changefeeds.MutableChangefeeds(index)
+                        ->MutableChangefeed()->set_name(ChangefeedsNames[index]);
+                }
+                ChangefeedsInitialized = true;
+            } else if (static_cast<ui64>(item.Changefeeds.ChangefeedsSize())
+                    != ChangefeedsPrefixes.size()) {
+                return Reply(Ydb::StatusIds::BAD_REQUEST,
+                    "changefeed metadata changed while its sidecars were being downloaded");
+            }
 
             HeadObject(CurrentChangefeedDescriptionKey());
         } else {
@@ -1037,7 +1197,14 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
         }
     }
 
+    void RetryDownloadingTopic() {
+        HeadObject(CurrentTopicDescriptionKey());
+    }
+
     void StartDownloadingScheme() {
+        Candidate = ESchemeCandidate::TableSql;
+        SchemeKey = TableSqlKey;
+        SchemeFileType = NBackup::EBackupFileType::TableCreate;
         ResetRetries();
         DownloadScheme();
         Become(&TThis::StateDownloadScheme);
@@ -1064,13 +1231,21 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
     }
 
 public:
-    explicit TSchemeGetter(const TActorId& replyTo, TImportInfo::TPtr importInfo, ui32 itemIdx, TMaybe<NBackup::TEncryptionIV> iv)
+    explicit TSchemeGetter(
+        const TActorId& replyTo,
+        TImportInfo::TPtr importInfo,
+        ui32 itemIdx,
+        TMaybe<NBackup::TEncryptionIV> iv,
+        TString database)
         : TGetterFromS3<TSchemeGetter>(TGetterSettings::FromImportInfo(importInfo, std::move(iv)))
         , ImportInfo(std::move(importInfo))
         , ReplyTo(replyTo)
         , ItemIdx(itemIdx)
+        , Database(std::move(database))
         , MetadataKey(MetadataKeyFromSettings(*ImportInfo, itemIdx))
-        , SchemeKey(SchemeKeyFromSettings(*ImportInfo, itemIdx, "scheme.pb"))
+        , TableSqlKey(SchemeKeyFromSettings(*ImportInfo, itemIdx, NYdb::NDump::NFiles::CreateTable().FileName))
+        , TableProtobufKey(SchemeKeyFromSettings(*ImportInfo, itemIdx, NYdb::NDump::NFiles::TableScheme().FileName))
+        , SchemeKey(TableSqlKey)
         , PermissionsKey(PermissionsKeyFromSettings(*ImportInfo, itemIdx))
         , IndexPopulationMode(ImportInfo->GetIndexPopulationMode())
         , NeedDownloadPermissions(!ImportInfo->GetNoAcl())
@@ -1139,7 +1314,7 @@ public:
             hFunc(TEvExternalStorage::TEvHeadObjectResponse, HandleTopic);
             hFunc(TEvExternalStorage::TEvGetObjectResponse, HandleTopic);
 
-            sFunc(TEvents::TEvWakeup, DownloadChangefeeds);
+            sFunc(TEvents::TEvWakeup, RetryDownloadingTopic);
             sFunc(TEvents::TEvPoisonPill, PassAway);
         }
     }
@@ -1148,15 +1323,21 @@ private:
     TImportInfo::TPtr ImportInfo;
     const TActorId ReplyTo;
     const ui32 ItemIdx;
+    const TString Database;
 
     const TString MetadataKey;
+    const TString TableSqlKey;
+    const TString TableProtobufKey;
     TString SchemeKey;
-    NBackup::EBackupFileType SchemeFileType = NBackup::EBackupFileType::TableSchema;
+    NBackup::EBackupFileType SchemeFileType = NBackup::EBackupFileType::TableCreate;
     const TString PermissionsKey;
     ui32 SchemePropertiesIdx = 0;
+    ESchemeCandidate Candidate = ESchemeCandidate::TableSql;
 
     TVector<TString> ChangefeedsPrefixes;
+    TVector<TString> ChangefeedsNames;
     ui64 IndexDownloadedChangefeed = 0;
+    bool ChangefeedsInitialized = false;
 
     TVector<NBackup::TIndexMetadata> IndexImplTablePrefixes;
     ui64 IndexCheckedMaterializedIndexImplTable = 0;
@@ -1787,8 +1968,14 @@ public:
     }
 };
 
-IActor* CreateSchemeGetter(const TActorId& replyTo, TImportInfo::TPtr importInfo, ui32 itemIdx, TMaybe<NBackup::TEncryptionIV> iv) {
-    return new TSchemeGetter(replyTo, std::move(importInfo), itemIdx, std::move(iv));
+IActor* CreateSchemeGetter(
+    const TActorId& replyTo,
+    TImportInfo::TPtr importInfo,
+    ui32 itemIdx,
+    TMaybe<NBackup::TEncryptionIV> iv,
+    TString database)
+{
+    return new TSchemeGetter(replyTo, std::move(importInfo), itemIdx, std::move(iv), std::move(database));
 }
 
 IActor* CreateSchemaMappingGetter(const TActorId& replyTo, TImportInfo::TPtr importInfo) {

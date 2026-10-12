@@ -6,14 +6,20 @@
 
 #include <ydb/core/base/auth.h>
 #include <ydb/core/base/path.h>
+#include <ydb/core/base/table_index.h>
 #include <ydb/core/persqueue/public/schema/schema_propose.h>
 #include <ydb/core/protos/s3_settings.pb.h>
 #include <ydb/core/protos/fs_settings.pb.h>
+#include <ydb/core/scheme/scheme_types_proto.h>
 #include <ydb/core/ydb_convert/table_description.h>
 #include <ydb/core/ydb_convert/topic_description.h>
 #include <ydb/core/ydb_convert/ydb_convert.h>
 
 #include <google/protobuf/util/time_util.h>
+
+#include <util/generic/hash_set.h>
+
+#include <exception>
 
 namespace NKikimr {
 namespace NSchemeShard {
@@ -118,16 +124,6 @@ THolder<TEvSchemeShard::TEvModifySchemeTransaction> CreateTablePropose(
     return propose;
 }
 
-THolder<TEvSchemeShard::TEvModifySchemeTransaction> CreateTablePropose(
-    TSchemeShard* ss,
-    TTxId txId,
-    const TImportInfo& importInfo,
-    ui32 itemIdx
-) {
-    TString unused;
-    return CreateTablePropose(ss, txId, importInfo, itemIdx, unused);
-}
-
 template <typename TPath>
 static auto GetDescription(TSchemeShard* ss, const TPath& path) {
     NKikimrSchemeOp::TDescribeOptions opts;
@@ -144,58 +140,148 @@ static NKikimrSchemeOp::TTableDescription GetTableDescription(TSchemeShard* ss, 
     Y_ABORT_UNLESS(pathDesc.HasTable() || pathDesc.HasColumnTableDescription());
 
     if (pathDesc.HasColumnTableDescription()) {
-        NKikimrSchemeOp::TTableDescription result;
         const auto& columnTable = pathDesc.GetColumnTableDescription();
-        THashMap<TString, ui32> columnIds;
-        for (const auto& column : columnTable.GetSchema().GetColumns()) {
-            auto& dstColumn = *result.add_columns();
-            dstColumn.set_name(column.GetName());
-            dstColumn.set_type(column.GetType());
-            dstColumn.set_typeid_(column.GetTypeId());
-            dstColumn.set_id(column.GetId());
-            columnIds[column.GetName()] = column.GetId();
-        }
-
-        result.MutableKeyColumnNames()->CopyFrom(columnTable.GetSchema().GetKeyColumnNames());
-        for (const auto& keyColumnName : columnTable.GetSchema().GetKeyColumnNames()) {
-            auto it = columnIds.find(keyColumnName);
-            Y_ABORT_UNLESS(it != columnIds.end());
-            result.AddKeyColumnIds(it->second);
-        }
-
-        result.MutablePartitionConfig()->MutablePartitioningPolicy()->SetMinPartitionsCount(columnTable.GetColumnShardCount());
-        return result;
+        return MakeColumnTableDataLayout(columnTable);
     }
 
     return record.GetPathDescription().GetTable();
 }
 
-static NKikimrSchemeOp::TTableDescription RebuildTableDescription(
-    const NKikimrSchemeOp::TTableDescription& src,
-    const Ydb::Table::CreateTableRequest& scheme
+NKikimrSchemeOp::TTableDescription MakeColumnTableDataLayout(
+    const NKikimrSchemeOp::TColumnTableDescription& columnTable)
+{
+    NKikimrSchemeOp::TTableDescription result;
+    THashMap<TString, ui32> columnIds;
+    for (const auto& column : columnTable.GetSchema().GetColumns()) {
+        auto& dstColumn = *result.AddColumns();
+        dstColumn.SetName(column.GetName());
+        dstColumn.SetType(column.GetType());
+        dstColumn.SetTypeId(column.GetTypeId());
+        dstColumn.SetId(column.GetId());
+        if (column.HasTypeInfo()) {
+            dstColumn.MutableTypeInfo()->CopyFrom(column.GetTypeInfo());
+        }
+        if (column.HasNotNull()) {
+            dstColumn.SetNotNull(column.GetNotNull());
+        }
+        columnIds[column.GetName()] = column.GetId();
+    }
+
+    result.MutableKeyColumnNames()->CopyFrom(columnTable.GetSchema().GetKeyColumnNames());
+    for (const auto& keyColumnName : columnTable.GetSchema().GetKeyColumnNames()) {
+        const auto it = columnIds.find(keyColumnName);
+        Y_ABORT_UNLESS(it != columnIds.end());
+        result.AddKeyColumnIds(it->second);
+    }
+
+    result.MutablePartitionConfig()->MutablePartitioningPolicy()->SetMinPartitionsCount(
+        columnTable.GetColumnShardCount());
+    return result;
+}
+
+static bool HasCompatibleDataType(
+    const NKikimrSchemeOp::TColumnDescription& destination,
+    const Ydb::Table::ColumnMeta& backup,
+    TString& error
 ) {
-    NKikimrSchemeOp::TTableDescription tableDesc;
-    tableDesc.MutableKeyColumnNames()->CopyFrom(src.GetKeyColumnNames());
-    tableDesc.MutableKeyColumnIds()->CopyFrom(src.GetKeyColumnIds());
+    NScheme::TTypeInfo backupType;
+    TString backupTypeMod;
+    Ydb::StatusIds::StatusCode status = Ydb::StatusIds::STATUS_CODE_UNSPECIFIED;
+    if (!ExtractColumnTypeInfo(backupType, backupTypeMod, backup.type(), status, error)) {
+        error = TStringBuilder() << "backup data column " << backup.name().Quote()
+            << " has an invalid type: " << error;
+        return false;
+    }
+
+    const auto destinationType = NScheme::TypeInfoModFromProtoColumnType(
+        destination.GetTypeId(),
+        destination.HasTypeInfo() ? &destination.GetTypeInfo() : nullptr);
+    if (destinationType.TypeInfo != backupType || destinationType.TypeMod != backupTypeMod) {
+        error = TStringBuilder() << "backup data column " << backup.name().Quote()
+            << " has type " << NScheme::TypeName(backupType, backupTypeMod)
+            << ", but the SQL-created destination column has type "
+            << NScheme::TypeName(destinationType.TypeInfo, destinationType.TypeMod);
+        return false;
+    }
+
+    return true;
+}
+
+bool RebuildTableDescriptionForImport(
+    const NKikimrSchemeOp::TTableDescription& destination,
+    const Ydb::Table::CreateTableRequest& backupLayout,
+    NKikimrSchemeOp::TTableDescription& restoreLayout,
+    TString& error)
+{
+    if (destination.KeyColumnNamesSize() != backupLayout.primary_key_size()) {
+        error = "backup and destination primary keys have different column counts";
+        return false;
+    }
+    for (int index = 0; index < backupLayout.primary_key_size(); ++index) {
+        if (destination.GetKeyColumnNames(index) != backupLayout.primary_key(index)) {
+            error = TStringBuilder()
+                << "backup primary key column " << backupLayout.primary_key(index).Quote()
+                << " does not match destination primary key column "
+                << destination.GetKeyColumnNames(index).Quote() << " at position " << index;
+            return false;
+        }
+    }
+
+    restoreLayout.MutableKeyColumnNames()->CopyFrom(destination.GetKeyColumnNames());
+    restoreLayout.MutableKeyColumnIds()->CopyFrom(destination.GetKeyColumnIds());
 
     THashMap<TString, ui32> columnNameToIdx;
-    for (ui32 i = 0; i < src.ColumnsSize(); ++i) {
-        Y_ABORT_UNLESS(columnNameToIdx.emplace(src.GetColumns(i).GetName(), i).second);
+    for (ui32 i = 0; i < destination.ColumnsSize(); ++i) {
+        if (!columnNameToIdx.emplace(destination.GetColumns(i).GetName(), i).second) {
+            error = TStringBuilder() << "destination table has duplicate column "
+                << destination.GetColumns(i).GetName().Quote();
+            return false;
+        }
     }
 
-    for (const auto& column : scheme.columns()) {
+    THashSet<TString> backupColumns;
+    for (const auto& column : backupLayout.columns()) {
+        if (!backupColumns.insert(column.name()).second) {
+            error = TStringBuilder() << "backup data layout has duplicate column "
+                << column.name().Quote();
+            return false;
+        }
         auto it = columnNameToIdx.find(column.name());
-        Y_ABORT_UNLESS(it != columnNameToIdx.end());
-
-        Y_ABORT_UNLESS(it->second < src.ColumnsSize());
-        tableDesc.MutableColumns()->Add()->CopyFrom(src.GetColumns(it->second));
+        if (it == columnNameToIdx.end() || it->second >= destination.ColumnsSize()) {
+            error = TStringBuilder() << "backup data column " << column.name().Quote()
+                << " is absent from the SQL-created destination table";
+            return false;
+        }
+        const auto& destinationColumn = destination.GetColumns(it->second);
+        if (destinationColumn.HasDefaultFromExpression()
+            && !destinationColumn.GetDefaultFromExpression().GetStored())
+        {
+            error = TStringBuilder() << "backup data layout contains virtual generated column "
+                << column.name().Quote() << ", which must not have stored cells";
+            return false;
+        }
+        if (!HasCompatibleDataType(destinationColumn, column, error)) {
+            return false;
+        }
+        restoreLayout.MutableColumns()->Add()->CopyFrom(destinationColumn);
     }
 
-    for (const auto& stat : scheme.statistics()) {
-        FillMultiColumnStatistics(*tableDesc.AddMultiColumnStatistics(), stat);
+    for (const auto& column : destination.GetColumns()) {
+        if (column.HasDefaultFromExpression()
+            && column.GetDefaultFromExpression().GetStored()
+            && !backupColumns.contains(column.GetName()))
+        {
+            error = TStringBuilder() << "backup data layout is missing stored generated column "
+                << column.GetName().Quote();
+            return false;
+        }
     }
 
-    return tableDesc;
+    for (const auto& stat : backupLayout.statistics()) {
+        FillMultiColumnStatistics(*restoreLayout.AddMultiColumnStatistics(), stat);
+    }
+
+    return true;
 }
 
 template <typename TSettings>
@@ -217,7 +303,8 @@ THolder<TEvSchemeShard::TEvModifySchemeTransaction> RestoreTableDataPropose(
     TSchemeShard* ss,
     TTxId txId,
     const TImportInfo& importInfo,
-    ui32 itemIdx
+    ui32 itemIdx,
+    TString& error
 ) {
     Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
     const auto& item = importInfo.Items.at(itemIdx);
@@ -237,7 +324,13 @@ THolder<TEvSchemeShard::TEvModifySchemeTransaction> RestoreTableDataPropose(
 
     auto& task = *modifyScheme.MutableRestore();
     task.SetTableName(dstPath.LeafName());
-    *task.MutableTableDescription() = RebuildTableDescription(GetTableDescription(ss, item.DstPathId), *item.Table);
+    if (!RebuildTableDescriptionForImport(
+            GetTableDescription(ss, item.DstPathId),
+            *item.Table,
+            *task.MutableTableDescription(),
+            error)) {
+        return nullptr;
+    }
 
     switch (importInfo.Kind) {
     case TImportInfo::EKind::S3:
@@ -308,12 +401,126 @@ THolder<TEvSchemeShard::TEvCancelTx> CancelRestoreTableDataPropose(
     return propose;
 }
 
+static bool FillSqlIndexBuildType(
+    const NKikimrSchemeOp::TIndexCreationConfig& index,
+    Ydb::Table::TableIndex& buildIndex,
+    TString& error)
+{
+    switch (index.GetType()) {
+        case NKikimrSchemeOp::EIndexTypeGlobal:
+            buildIndex.mutable_global_index();
+            return true;
+        case NKikimrSchemeOp::EIndexTypeGlobalAsync:
+            buildIndex.mutable_global_async_index();
+            return true;
+        case NKikimrSchemeOp::EIndexTypeGlobalUnique:
+            buildIndex.mutable_global_unique_index();
+            return true;
+        case NKikimrSchemeOp::EIndexTypeGlobalVectorKmeansTree:
+            *buildIndex.mutable_global_vector_kmeans_tree_index()->mutable_vector_settings()
+                = index.GetVectorIndexKmeansTreeDescription().GetSettings();
+            return true;
+        case NKikimrSchemeOp::EIndexTypeGlobalFulltextPlain:
+        case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompact:
+            *buildIndex.mutable_global_fulltext_plain_index()->mutable_fulltext_settings()
+                = index.GetFulltextIndexDescription().GetSettings();
+            return true;
+        case NKikimrSchemeOp::EIndexTypeGlobalFulltextRelevance:
+        case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompactRelevance:
+            *buildIndex.mutable_global_fulltext_relevance_index()->mutable_fulltext_settings()
+                = index.GetFulltextIndexDescription().GetSettings();
+            return true;
+        case NKikimrSchemeOp::EIndexTypeGlobalJson:
+        case NKikimrSchemeOp::EIndexTypeGlobalJsonCompact:
+            buildIndex.mutable_global_json_index();
+            return true;
+        default:
+            error = TStringBuilder() << "SQL index " << index.GetName().Quote()
+                << " has unsupported build type " << static_cast<ui32>(index.GetType());
+            return false;
+    }
+}
+
+static bool FillSqlIndexBuildSettings(
+    const NKikimrSchemeOp::TIndexCreationConfig& index,
+    Ydb::Table::TableIndex& buildIndex,
+    TString& error)
+{
+    buildIndex.set_name(index.GetName());
+    buildIndex.mutable_index_columns()->CopyFrom(index.GetKeyColumnNames());
+    buildIndex.mutable_data_columns()->CopyFrom(index.GetDataColumnNames());
+    if (!FillSqlIndexBuildType(index, buildIndex, error)) {
+        return false;
+    }
+
+    // An empty list means the compiler left presharding at its defaults. When
+    // descriptions are present, convert through the established internal ->
+    // public adapter so every implementation-table setting reaches the index
+    // builder (partitioning, replicas, vector/fulltext table settings, etc.).
+    if (index.IndexImplTableDescriptionsSize() == 0) {
+        return true;
+    }
+
+    const TVector<TString> keyColumns(
+        index.GetKeyColumnNames().begin(), index.GetKeyColumnNames().end());
+    const size_t expectedImplTables =
+        NTableIndex::GetImplTables(index.GetType(), keyColumns).size();
+    if (static_cast<size_t>(index.IndexImplTableDescriptionsSize()) != expectedImplTables) {
+        error = TStringBuilder() << "SQL index " << index.GetName().Quote()
+            << " has " << index.IndexImplTableDescriptionsSize()
+            << " implementation table descriptions, expected " << expectedImplTables;
+        return false;
+    }
+
+    NKikimrSchemeOp::TTableDescription table;
+    auto* tableIndex = table.AddTableIndexes();
+    tableIndex->SetName(index.GetName());
+    tableIndex->SetType(index.GetType());
+    if (index.HasState()) {
+        tableIndex->SetState(index.GetState());
+    }
+    tableIndex->MutableKeyColumnNames()->CopyFrom(index.GetKeyColumnNames());
+    tableIndex->MutableDataColumnNames()->CopyFrom(index.GetDataColumnNames());
+    tableIndex->MutableIndexImplTableDescriptions()->CopyFrom(
+        index.GetIndexImplTableDescriptions());
+    if (index.HasVectorIndexKmeansTreeDescription()) {
+        tableIndex->MutableVectorIndexKmeansTreeDescription()->CopyFrom(
+            index.GetVectorIndexKmeansTreeDescription());
+    } else if (index.HasFulltextIndexDescription()) {
+        tableIndex->MutableFulltextIndexDescription()->CopyFrom(
+            index.GetFulltextIndexDescription());
+    } else if (index.HasBloomFilterDescription()) {
+        tableIndex->MutableBloomFilterDescription()->CopyFrom(
+            index.GetBloomFilterDescription());
+    } else if (index.HasBloomNGrammFilterDescription()) {
+        tableIndex->MutableBloomNGrammFilterDescription()->CopyFrom(
+            index.GetBloomNGrammFilterDescription());
+    }
+
+    Ydb::Table::CreateTableRequest converted;
+    try {
+        FillIndexDescription(converted, table);
+    } catch (const std::exception& ex) {
+        error = TStringBuilder() << "cannot convert SQL index "
+            << index.GetName().Quote() << " to index build settings: " << ex.what();
+        return false;
+    }
+    if (converted.indexes_size() != 1) {
+        error = TStringBuilder() << "cannot convert SQL index "
+            << index.GetName().Quote() << " to index build settings";
+        return false;
+    }
+    buildIndex.CopyFrom(converted.indexes(0));
+    return true;
+}
+
 THolder<TEvIndexBuilder::TEvCreateRequest> BuildIndexPropose(
     TSchemeShard* ss,
     TTxId txId,
     const TImportInfo& importInfo,
     ui32 itemIdx,
-    const TString& uid
+    const TString& uid,
+    TString& error
 ) {
     Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
     const auto& item = importInfo.Items.at(itemIdx);
@@ -327,8 +534,21 @@ THolder<TEvIndexBuilder::TEvCreateRequest> BuildIndexPropose(
         settings.set_max_shards_in_flight(ss->MaxRestoreBuildIndexShardsInFlight);
     }
 
-    Y_ABORT_UNLESS(item.NextIndexIdx < item.Table->indexes_size());
-    settings.mutable_index()->CopyFrom(item.Table->indexes(item.NextIndexIdx));
+    if (item.UsesSqlSchema()) {
+        if (!item.TableSchemaPlan || item.NextIndexIdx >= item.TableSchemaPlan->IndexesSize()) {
+            error = "SQL index cursor is outside the prepared table schema plan";
+            return nullptr;
+        }
+
+        const auto& index = item.TableSchemaPlan->GetIndexes(item.NextIndexIdx);
+        auto* buildIndex = settings.mutable_index();
+        if (!FillSqlIndexBuildSettings(index, *buildIndex, error)) {
+            return nullptr;
+        }
+    } else {
+        Y_ABORT_UNLESS(item.NextIndexIdx < item.Table->indexes_size());
+        settings.mutable_index()->CopyFrom(item.Table->indexes(item.NextIndexIdx));
+    }
 
     if (settings.mutable_index()->type_case() == Ydb::Table::TableIndex::TypeCase::TYPE_NOT_SET) {
         settings.mutable_index()->mutable_global_index();
@@ -339,6 +559,13 @@ THolder<TEvIndexBuilder::TEvCreateRequest> BuildIndexPropose(
     auto& request = propose->Record;
     (*request.MutableOperationParams()->mutable_labels())["uid"] = uid;
     request.SetInternal(true);
+    if (importInfo.UserSID) {
+        request.SetUserSID(*importInfo.UserSID);
+    }
+    if (item.UsesSqlSchema()) {
+        request.SetInternalIndexType(static_cast<ui32>(
+            item.TableSchemaPlan->GetIndexes(item.NextIndexIdx).GetType()));
+    }
 
     return propose;
 }
@@ -469,6 +696,10 @@ THolder<TEvSchemeShard::TEvModifySchemeTransaction> CreateConsumersPropose(
     pqGroup.MutablePQTabletConfig()->ClearPartitionKeySchema();
 
     auto* tabletConfig = pqGroup.MutablePQTabletConfig();
+    // SQL owns topic settings while the sidecar owns the complete consumer
+    // set. Replacing the set also makes recovery safe if an older importer
+    // ever retries this ALTER under a different transaction id.
+    tabletConfig->ClearConsumers();
     const auto& pqConfig = AppData()->PQConfig;
 
     for (const auto& consumer : topic.consumers()) {
