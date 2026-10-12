@@ -2,11 +2,63 @@ import "ydb/public/api/protos/ydb_import.proto";
 import "ydb/public/api/protos/ydb_issue_message.proto";
 import "ydb/public/api/protos/ydb_operation.proto";
 import "ydb/public/api/protos/ydb_status_codes.proto";
+import "ydb/core/protos/flat_scheme_op.proto";
 
 import "google/protobuf/timestamp.proto";
 
 package NKikimrImport;
 option java_package = "ru.yandex.kikimr.proto";
+
+message TTableSchemaImportPlan {
+    enum ESchemaSource {
+        SCHEMA_SOURCE_UNDECIDED = 0;
+        SCHEMA_SOURCE_SQL = 1;
+        SCHEMA_SOURCE_PROTOBUF = 2;
+    }
+
+    enum EStatementKind {
+        STATEMENT_KIND_UNSPECIFIED = 0;
+        STATEMENT_KIND_CREATE_TABLE = 1;
+        STATEMENT_KIND_ALTER_SEQUENCE = 2;
+        STATEMENT_KIND_ALTER_TABLE = 3;
+        STATEMENT_KIND_ALTER_OBJECT = 4;
+        STATEMENT_KIND_ALTER_TOPIC = 5;
+    }
+
+    enum EPhase {
+        PHASE_BEFORE_DATA = 0;
+        PHASE_AFTER_INDEXES = 1;
+        PHASE_CHANGEFEEDS = 2;
+    }
+
+    message TStatement {
+        optional uint32 Ordinal = 1;
+        optional EStatementKind Kind = 2;
+        optional EPhase Phase = 3;
+        optional string Target = 4;
+        optional string Sql = 5;
+        repeated NKikimrSchemeOp.TModifyScheme PreparedOperations = 6;
+        // ALTER INDEX settings must run before materialized data import, but
+        // only after an index build when the import selected BUILD.  Keep the
+        // classification durable so phase normalization survives reboot.
+        optional bool PopulationDependentIndexSettings = 7;
+        optional string IndexName = 8;
+    }
+
+    optional uint32 FormatVersion = 1;
+    optional ESchemaSource Source = 2;
+    optional string RewrittenScript = 3;
+    repeated TStatement Statements = 4;
+    repeated NKikimrSchemeOp.TIndexCreationConfig Indexes = 5;
+    optional EPhase Phase = 6;
+    optional uint32 StatementCursor = 7;
+    optional uint32 OperationCursor = 8;
+    optional bool FirstMutationCompleted = 9;
+    optional string FallbackReason = 10;
+    optional uint64 PreparationAttempt = 11;
+    optional bool CurrentOperationAccepted = 12;
+    optional bool ForceBuildIndexes = 13;
+}
 
 message TImport {
     optional uint64 Id = 1;

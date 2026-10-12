@@ -32,6 +32,7 @@ PEERDIR(
 )
 
 SRCS(
+    ut_import_table_sql.cpp
     ut_restore.cpp
     ut_restore_fs.cpp
 )

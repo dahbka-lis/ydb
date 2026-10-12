@@ -300,6 +300,7 @@ SRCS(
     schemeshard_import__list.cpp
     schemeshard_import_flow_proposals.cpp
     schemeshard_import_scheme_query_executor.cpp
+    schemeshard_import_table_scheme.cpp
     schemeshard_info_types.cpp
     schemeshard_info_types.h
     schemeshard_path.cpp
@@ -415,8 +416,15 @@ PEERDIR(
     ydb/library/protobuf_printer
     ydb/public/lib/ydb_cli/dump/files
     ydb/public/lib/ydb_cli/dump/util
+    yql/essentials/ast
     yql/essentials/minikql
+    yql/essentials/parser/proto_ast/gen/v1_proto_split_antlr4
     yql/essentials/providers/common/proto
+    yql/essentials/sql/settings
+    yql/essentials/sql/v1/lexer
+    yql/essentials/sql/v1/lexer/antlr4
+    yql/essentials/sql/v1/lexer/antlr4_ansi
+    yql/essentials/sql/v1/proto_parser
     ydb/services/bg_tasks
     ydb/core/tx/columnshard/bg_tasks/manager
     ydb/core/tx/tiering/tier

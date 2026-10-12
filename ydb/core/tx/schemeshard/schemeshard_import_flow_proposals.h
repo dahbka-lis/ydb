@@ -5,6 +5,17 @@
 namespace NKikimr {
 namespace NSchemeShard {
 
+NKikimrSchemeOp::TTableDescription MakeColumnTableDataLayout(
+    const NKikimrSchemeOp::TColumnTableDescription& columnTable
+);
+
+bool RebuildTableDescriptionForImport(
+    const NKikimrSchemeOp::TTableDescription& destination,
+    const Ydb::Table::CreateTableRequest& backupLayout,
+    NKikimrSchemeOp::TTableDescription& restoreLayout,
+    TString& error
+);
+
 THolder<TEvSchemeShard::TEvModifySchemeTransaction> CreateTablePropose(
     TSchemeShard* ss,
     TTxId txId,
@@ -13,18 +24,12 @@ THolder<TEvSchemeShard::TEvModifySchemeTransaction> CreateTablePropose(
     TString& error
 );
 
-THolder<TEvSchemeShard::TEvModifySchemeTransaction> CreateTablePropose(
-    TSchemeShard* ss,
-    TTxId txId,
-    const TImportInfo& importInfo,
-    ui32 itemIdx
-);
-
 THolder<TEvSchemeShard::TEvModifySchemeTransaction> RestoreTableDataPropose(
     TSchemeShard* ss,
     TTxId txId,
     const TImportInfo& importInfo,
-    ui32 itemIdx
+    ui32 itemIdx,
+    TString& error
 );
 
 THolder<TEvSchemeShard::TEvCancelTx> CancelRestoreTableDataPropose(
@@ -37,7 +42,8 @@ THolder<TEvIndexBuilder::TEvCreateRequest> BuildIndexPropose(
     TTxId txId,
     const TImportInfo& importInfo,
     ui32 itemIdx,
-    const TString& uid
+    const TString& uid,
+    TString& error
 );
 
 THolder<TEvIndexBuilder::TEvCancelRequest> CancelIndexBuildPropose(

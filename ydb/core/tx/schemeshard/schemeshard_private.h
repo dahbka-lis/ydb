@@ -11,6 +11,7 @@
 #include <ydb/library/actors/core/events.h>
 
 #include <util/datetime/base.h>
+#include <util/generic/vector.h>
 
 namespace NKikimr {
 namespace NSchemeShard {
@@ -144,25 +145,35 @@ namespace TEvPrivate {
     };
 
     struct TEvImportSchemeQueryResult: public TEventLocal<TEvImportSchemeQueryResult, EvImportSchemeQueryResult> {
+        using TPreparedOperations = TVector<NKikimrSchemeOp::TModifyScheme>;
+
         const ui64 ImportId;
         const ui32 ItemIdx;
+        const ui32 StatementOrdinal;
+        const ui64 PreparationAttempt;
         const Ydb::StatusIds::StatusCode Status;
-        const std::variant<TString, NKikimrSchemeOp::TModifyScheme> Result;
+        const std::variant<TString, TPreparedOperations> Result;
 
         // failed query
-        TEvImportSchemeQueryResult(ui64 id, ui32 itemIdx, Ydb::StatusIds::StatusCode status, TString&& error)
+        TEvImportSchemeQueryResult(ui64 id, ui32 itemIdx, ui32 statementOrdinal, ui64 preparationAttempt,
+                Ydb::StatusIds::StatusCode status, TString&& error)
             : ImportId(id)
             , ItemIdx(itemIdx)
+            , StatementOrdinal(statementOrdinal)
+            , PreparationAttempt(preparationAttempt)
             , Status(status)
             , Result(error)
         {}
 
         // successful query
-        TEvImportSchemeQueryResult(ui64 id, ui32 itemIdx, Ydb::StatusIds::StatusCode status, NKikimrSchemeOp::TModifyScheme&& preparedQuery)
+        TEvImportSchemeQueryResult(ui64 id, ui32 itemIdx, ui32 statementOrdinal, ui64 preparationAttempt,
+                Ydb::StatusIds::StatusCode status, TPreparedOperations&& preparedOperations)
             : ImportId(id)
             , ItemIdx(itemIdx)
+            , StatementOrdinal(statementOrdinal)
+            , PreparationAttempt(preparationAttempt)
             , Status(status)
-            , Result(preparedQuery)
+            , Result(std::move(preparedOperations))
         {}
     };
 

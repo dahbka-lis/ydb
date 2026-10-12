@@ -1918,7 +1918,13 @@ void FillPartitioningSettingsImpl(TYdbProto& out,
 void FillGlobalIndexSettings(Ydb::Table::GlobalIndexSettings& settings,
     const NKikimrSchemeOp::TTableDescription& indexImplTableDescription
 ) {
-    if (indexImplTableDescription.SplitBoundarySize()) {
+    // UniformPartitionsCount is a create-time setting and is normally absent
+    // from described tables.  It is nevertheless present in prepared index
+    // creation configs, so keep it when such a config is converted back to the
+    // public index-build request.
+    if (indexImplTableDescription.HasUniformPartitionsCount()) {
+        settings.set_uniform_partitions(indexImplTableDescription.GetUniformPartitionsCount());
+    } else if (indexImplTableDescription.SplitBoundarySize()) {
         NKikimrMiniKQL::TType splitKeyType;
         Ydb::Table::DescribeTableResult unused;
         FillColumnDescription(unused, splitKeyType, indexImplTableDescription);

@@ -13,6 +13,8 @@
 
 #include <library/cpp/time_provider/time_provider.h>
 
+#include <util/string/builder.h>
+
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::IMPORT
 
 using namespace NKikimr::NKqp;
@@ -20,6 +22,91 @@ using namespace NKikimr::NKqp;
 namespace NKikimr::NSchemeShard {
 
 class TSchemeQueryExecutor: public TActorBootstrapped<TSchemeQueryExecutor> {
+    using TStatementKind = NKikimrImport::TTableSchemaImportPlan::EStatementKind;
+    using TPreparedOperations = TEvPrivate::TEvImportSchemeQueryResult::TPreparedOperations;
+
+    const NKikimrSchemeOp::TModifyScheme* ExtractExpectedOperation(
+        const NKqpProto::TKqpSchemeOperation& operation) const
+    {
+        using TSchemeOperation = NKqpProto::TKqpSchemeOperation;
+
+        switch (ExpectedKind) {
+            case NKikimrImport::TTableSchemaImportPlan::STATEMENT_KIND_CREATE_TABLE:
+                switch (operation.GetOperationCase()) {
+                    case TSchemeOperation::kCreateTable:
+                        return &operation.GetCreateTable();
+                    case TSchemeOperation::kCreateColumnTable:
+                        return &operation.GetCreateColumnTable();
+                    default:
+                        return nullptr;
+                }
+            case NKikimrImport::TTableSchemaImportPlan::STATEMENT_KIND_ALTER_SEQUENCE:
+                return operation.GetOperationCase() == TSchemeOperation::kAlterSequence
+                    ? &operation.GetAlterSequence()
+                    : nullptr;
+            case NKikimrImport::TTableSchemaImportPlan::STATEMENT_KIND_ALTER_TABLE:
+                switch (operation.GetOperationCase()) {
+                    case TSchemeOperation::kAlterTable:
+                        return &operation.GetAlterTable();
+                    case TSchemeOperation::kAlterColumnTable:
+                        return &operation.GetAlterColumnTable();
+                    default:
+                        return nullptr;
+                }
+            case NKikimrImport::TTableSchemaImportPlan::STATEMENT_KIND_ALTER_OBJECT:
+                return operation.GetObjectType() == "TABLE"
+                    && operation.GetOperationCase() == TSchemeOperation::kAlterColumnTable
+                    ? &operation.GetAlterColumnTable()
+                    : nullptr;
+            case NKikimrImport::TTableSchemaImportPlan::STATEMENT_KIND_ALTER_TOPIC:
+                return operation.GetOperationCase() == TSchemeOperation::kAlterTopic
+                    ? &operation.GetAlterTopic()
+                    : nullptr;
+            case NKikimrImport::TTableSchemaImportPlan::STATEMENT_KIND_UNSPECIFIED:
+                switch (operation.GetOperationCase()) {
+                    case TSchemeOperation::kCreateView:
+                        return &operation.GetCreateView();
+                    case TSchemeOperation::kCreateReplication:
+                        return &operation.GetCreateReplication();
+                    case TSchemeOperation::kCreateTransfer:
+                        return &operation.GetCreateTransfer();
+                    case TSchemeOperation::kCreateExternalDataSource:
+                        return &operation.GetCreateExternalDataSource();
+                    case TSchemeOperation::kCreateExternalTable:
+                        return &operation.GetCreateExternalTable();
+                    default:
+                        return nullptr;
+                }
+        }
+        return nullptr;
+    }
+
+    bool IsExpectedModifyOperation(const NKikimrSchemeOp::TModifyScheme& operation) const {
+        using NKikimrSchemeOp::EOperationType;
+
+        switch (ExpectedKind) {
+            case NKikimrImport::TTableSchemaImportPlan::STATEMENT_KIND_CREATE_TABLE:
+                return operation.GetOperationType() == EOperationType::ESchemeOpCreateTable
+                    || operation.GetOperationType() == EOperationType::ESchemeOpCreateIndexedTable
+                    || operation.GetOperationType() == EOperationType::ESchemeOpCreateColumnTable;
+            case NKikimrImport::TTableSchemaImportPlan::STATEMENT_KIND_ALTER_SEQUENCE:
+                return operation.GetOperationType() == EOperationType::ESchemeOpAlterSequence;
+            case NKikimrImport::TTableSchemaImportPlan::STATEMENT_KIND_ALTER_TABLE:
+                return operation.GetOperationType() == EOperationType::ESchemeOpAlterTable
+                    || operation.GetOperationType() == EOperationType::ESchemeOpAlterColumnTable
+                    || operation.GetOperationType() == EOperationType::ESchemeOpCreateTableIndex
+                    || operation.GetOperationType() == EOperationType::ESchemeOpAlterTableIndex
+                    || operation.GetOperationType() == EOperationType::ESchemeOpCreateCdcStream;
+            case NKikimrImport::TTableSchemaImportPlan::STATEMENT_KIND_ALTER_OBJECT:
+                return operation.GetOperationType() == EOperationType::ESchemeOpAlterColumnTable
+                    || operation.GetOperationType() == EOperationType::ESchemeOpAlterTable;
+            case NKikimrImport::TTableSchemaImportPlan::STATEMENT_KIND_ALTER_TOPIC:
+                return operation.GetOperationType() == EOperationType::ESchemeOpAlterPersQueueGroup;
+            case NKikimrImport::TTableSchemaImportPlan::STATEMENT_KIND_UNSPECIFIED:
+                return true;
+        }
+        return false;
+    }
 
     std::unique_ptr<TEvKqp::TEvCompileRequest> BuildCompileRequest() {
         UserToken.Reset(MakeIntrusive<NACLib::TUserToken>(""));
@@ -91,31 +178,34 @@ class TSchemeQueryExecutor: public TActorBootstrapped<TSchemeQueryExecutor> {
         if (transactions.empty()) {
             return Finish(Ydb::StatusIds::GENERIC_ERROR, "empty transactions");
         }
-        if (!transactions[0].HasSchemeOperation()) {
-            return Finish(Ydb::StatusIds::GENERIC_ERROR, "no scheme operations");
+        TPreparedOperations operations;
+        operations.reserve(transactions.size());
+        for (ui32 index = 0; index < transactions.size(); ++index) {
+            const auto& transaction = transactions[index];
+            if (!transaction.HasSchemeOperation()) {
+                return Finish(Ydb::StatusIds::GENERIC_ERROR, TStringBuilder()
+                    << "physical transaction " << index << " has no scheme operation");
+            }
+            const auto& schemeOperation = transaction.GetSchemeOperation();
+            const auto* operation = ExtractExpectedOperation(schemeOperation);
+            if (!operation || !IsExpectedModifyOperation(*operation)) {
+                return Finish(Ydb::StatusIds::UNSUPPORTED, TStringBuilder()
+                    << "unsupported physical scheme operation case "
+                    << static_cast<ui32>(schemeOperation.GetOperationCase())
+                    << " in transaction " << index);
+            }
+            operations.push_back(*operation);
+        }
+        if (ExpectedKind == NKikimrImport::TTableSchemaImportPlan::STATEMENT_KIND_UNSPECIFIED
+            && operations.size() != 1) {
+            return Finish(Ydb::StatusIds::GENERIC_ERROR,
+                "legacy creation query produced multiple physical operations");
         }
 
-        if (transactions[0].GetSchemeOperation().HasCreateView()) {
-            const auto& createView = transactions[0].GetSchemeOperation().GetCreateView();
-            return Finish(result->Status, createView);
-        } else if (transactions[0].GetSchemeOperation().HasCreateReplication()) {
-            const auto& createReplication = transactions[0].GetSchemeOperation().GetCreateReplication();
-            return Finish(result->Status, createReplication);
-        } else if (transactions[0].GetSchemeOperation().HasCreateTransfer()) {
-            const auto& createTransfer = transactions[0].GetSchemeOperation().GetCreateTransfer();
-            return Finish(result->Status, createTransfer);
-        } else if (transactions[0].GetSchemeOperation().HasCreateExternalDataSource()) {
-            const auto& createExternalDataSource = transactions[0].GetSchemeOperation().GetCreateExternalDataSource();
-            return Finish(result->Status, createExternalDataSource);
-        } else if (transactions[0].GetSchemeOperation().HasCreateExternalTable()) {
-            const auto& createExternalTable = transactions[0].GetSchemeOperation().GetCreateExternalTable();
-            return Finish(result->Status, createExternalTable);
-        }
-
-        return Finish(Ydb::StatusIds::GENERIC_ERROR, "no supported create operation");
+        return Finish(result->Status, std::move(operations));
     }
 
-    void Finish(Ydb::StatusIds::StatusCode status, std::variant<TString, NKikimrSchemeOp::TModifyScheme> result) {
+    void Finish(Ydb::StatusIds::StatusCode status, std::variant<TString, TPreparedOperations> result) {
         YDB_LOG_INFO("TSchemeQueryExecutor Reply",
             {"self", SelfId()},
             {"status", status},
@@ -128,14 +218,15 @@ class TSchemeQueryExecutor: public TActorBootstrapped<TSchemeQueryExecutor> {
                     {"status", status},
                     {"error", value},
                 );
-            } else if constexpr (std::is_same_v<T, NKikimrSchemeOp::TModifyScheme>) {
+            } else if constexpr (std::is_same_v<T, TPreparedOperations>) {
                 YDB_LOG_DEBUG("TSchemeQueryExecutor Reply",
                     {"self", SelfId()},
                     {"status", status},
-                    {"preparedQuery", value.ShortDebugString().Quote()},
+                    {"preparedOperations", value.size()},
                 );
             }
-            Send(ReplyTo, new TEvPrivate::TEvImportSchemeQueryResult(ImportId, ItemIdx, status, std::move(value)));
+            Send(ReplyTo, new TEvPrivate::TEvImportSchemeQueryResult(
+                ImportId, ItemIdx, StatementOrdinal, PreparationAttempt, status, std::move(value)));
         }, result);
 
         PassAway();
@@ -152,13 +243,19 @@ public:
         ui64 importId,
         ui32 itemIdx,
         const TString& schemeQuery,
-        const TString& database
+        const TString& database,
+        TStatementKind expectedKind,
+        ui32 statementOrdinal,
+        ui64 preparationAttempt
     )
         : ReplyTo(replyTo)
         , ImportId(importId)
         , ItemIdx(itemIdx)
         , SchemeQuery(schemeQuery)
         , Database(database)
+        , ExpectedKind(expectedKind)
+        , StatementOrdinal(statementOrdinal)
+        , PreparationAttempt(preparationAttempt)
     {
     }
 
@@ -187,6 +284,9 @@ private:
     ui32 ItemIdx;
     TString SchemeQuery;
     TString Database;
+    TStatementKind ExpectedKind;
+    ui32 StatementOrdinal;
+    ui64 PreparationAttempt;
 
     // The following pointer-type event arguments are necessary for constructing the compile request.
     // These pointers must remain valid until the compilation response is received.
@@ -197,8 +297,12 @@ private:
 
 }; // TSchemeQueryExecutor
 
-IActor* CreateSchemeQueryExecutor(NActors::TActorId replyTo, ui64 importId, ui32 itemIdx, const TString& schemeQuery, const TString& database) {
-    return new TSchemeQueryExecutor(replyTo, importId, itemIdx, schemeQuery, database);
+IActor* CreateSchemeQueryExecutor(NActors::TActorId replyTo, ui64 importId, ui32 itemIdx,
+        const TString& schemeQuery, const TString& database,
+        NKikimrImport::TTableSchemaImportPlan::EStatementKind expectedKind,
+        ui32 statementOrdinal, ui64 preparationAttempt) {
+    return new TSchemeQueryExecutor(
+        replyTo, importId, itemIdx, schemeQuery, database, expectedKind, statementOrdinal, preparationAttempt);
 }
 
 } // NKikimr::NSchemeShard

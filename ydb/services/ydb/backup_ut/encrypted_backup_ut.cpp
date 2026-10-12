@@ -1119,24 +1119,22 @@ protected:
             };
 
             const bool isOptionalCreateTable = key.EndsWith("/create_table.sql.enc");
-            const auto checkImport = [&](const TString& comments) {
-                if (isOptionalCreateTable) {
-                    checkImportSucceeds(comments);
-                } else {
-                    checkImportFails(comments);
-                }
-            };
 
             // Remove one file from export.
-            // In case of encrypted backup it must cause error,
-            // because no one should be able not modify export files,
-            // in particular, remove an export part (==file).
+            // create_table.sql is an optional SQL-first candidate: its absence
+            // selects scheme.pb. Every other encrypted artifact is required.
             S3Mock().GetData().erase(key);
-            checkImport(TStringBuilder() << "Remove key " << key);
+            if (isOptionalCreateTable) {
+                checkImportSucceeds(TStringBuilder() << "Remove key " << key);
+            } else {
+                checkImportFails(TStringBuilder() << "Remove key " << key);
+            }
 
             // Change IV (reencrypt with different, not expected, IV)
             S3Mock().GetData()[key] = ReencryptWithDifferentIV(sourceValue, encryptionKey, NExport::TExportToS3Settings::TEncryptionAlgorithm::AES_128_GCM);
-            checkImport(TStringBuilder() << "Change IV of " << key);
+            // A present but corrupted SQL candidate is not absence and must
+            // not be silently downgraded to protobuf.
+            checkImportFails(TStringBuilder() << "Change IV of " << key);
         }
     }
 };

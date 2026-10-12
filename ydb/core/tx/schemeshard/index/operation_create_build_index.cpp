@@ -335,6 +335,15 @@ TVector<ISubOperation::TPtr> CreateBuildIndex(TOperationId opId, const TTxTransa
                     docsTableDesc = indexDesc.GetIndexImplTableDescriptions(NTableIndex::NFulltext::DocsTablePosition);
                     statsTableDesc = indexDesc.GetIndexImplTableDescriptions(NTableIndex::NFulltext::StatsTablePosition);
                     indexTableDesc = indexDesc.GetIndexImplTableDescriptions(NTableIndex::NFulltext::PostingTablePosition);
+                } else if (indexDesc.IndexImplTableDescriptionsSize() == 3) {
+                    // Exact compact-relevance builds persist only their real
+                    // implementation tables, in GetImplTables() order:
+                    // docs, stats, posting.  The four-slot form above remains
+                    // supported for older callers using the public settings
+                    // layout (which includes a dictionary placeholder).
+                    docsTableDesc = indexDesc.GetIndexImplTableDescriptions(0);
+                    statsTableDesc = indexDesc.GetIndexImplTableDescriptions(1);
+                    indexTableDesc = indexDesc.GetIndexImplTableDescriptions(2);
                 }
             } else if (indexDesc.IndexImplTableDescriptionsSize() == 1) {
                 indexTableDesc = indexDesc.GetIndexImplTableDescriptions(0);

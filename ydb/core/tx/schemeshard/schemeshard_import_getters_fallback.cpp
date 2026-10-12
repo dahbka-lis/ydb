@@ -72,7 +72,13 @@ private:
     TEvImport::TEvListObjectsInS3ExportRequest::TPtr Request;
 }; // TListObjectsInS3ExportGetterFallback
 
-IActor* CreateSchemeGetter(const TActorId& replyTo, TImportInfo::TPtr importInfo, ui32 itemIdx, TMaybe<NBackup::TEncryptionIV>) {
+IActor* CreateSchemeGetter(
+    const TActorId& replyTo,
+    TImportInfo::TPtr importInfo,
+    ui32 itemIdx,
+    TMaybe<NBackup::TEncryptionIV>,
+    TString)
+{
     return new TSchemeGetterFallback(replyTo, std::move(importInfo), itemIdx);
 }
 

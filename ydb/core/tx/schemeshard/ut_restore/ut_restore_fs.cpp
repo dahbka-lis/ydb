@@ -10,6 +10,7 @@
 #include <library/cpp/json/json_writer.h>
 #include <util/folder/dirut.h>
 #include <util/folder/tempdir.h>
+#include <util/generic/algorithm.h>
 #include <util/stream/file.h>
 #include <util/system/fs.h>
 
@@ -60,6 +61,14 @@ public:
     void AddDataFile(const TString& tablePath, const TString& csvData, ui32 partNum = 0) {
         const TString fullPath = TempDir.Name() + "/" + tablePath;
         WriteDataFileWithChecksum(fullPath, csvData, partNum);
+    }
+
+    void AddTableCreationQuery(const TString& tablePath, const TString& sql) {
+        const TString fullPath = TempDir.Name() + "/" + tablePath;
+        WriteFileWithChecksum(
+            fullPath,
+            NYdb::NDump::NFiles::CreateTable().FileName,
+            sql);
     }
 
 private:
@@ -197,6 +206,75 @@ Y_UNIT_TEST_SUITE(TImportFromFsTests) {
         UNIT_ASSERT_VALUES_EQUAL(table.GetColumns(1).GetName(), "value");
         UNIT_ASSERT_VALUES_EQUAL(table.KeyColumnNamesSize(), 1);
         UNIT_ASSERT_VALUES_EQUAL(table.GetKeyColumnNames(0), "key");
+    }
+
+    Y_UNIT_TEST(SqlTablePreferredOverProto) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        ui64 txId = 100;
+        runtime.GetAppData().FeatureFlags.SetEnableFsBackups(true);
+
+        TTempBackupFiles backup;
+        backup.CreateTableBackup("backup/Table", "Table");
+        backup.AddTableCreationQuery("backup/Table", R"sql(
+            CREATE TABLE `OriginalTable` (
+                `key` Utf8 NOT NULL,
+                `value` Utf8,
+                `sql_only` Uint64,
+                PRIMARY KEY (`key`)
+            );
+        )sql");
+
+        TestImport(runtime, ++txId, "/MyRoot", Sprintf(R"(
+            ImportFromFsSettings {
+              base_path: "%s"
+              items {
+                source_path: "backup/Table"
+                destination_path: "/MyRoot/RestoredTable"
+              }
+            }
+        )", backup.GetBasePath().c_str()));
+        env.TestWaitNotification(runtime, txId);
+
+        const auto response = TestGetImport(runtime, txId, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        const auto describe = DescribePath(runtime, "/MyRoot/RestoredTable");
+        const auto& columns = describe.GetPathDescription().GetTable().GetColumns();
+        UNIT_ASSERT_VALUES_EQUAL(columns.size(), 3);
+        UNIT_ASSERT(AnyOf(columns, [](const auto& column) {
+            return column.GetName() == "sql_only";
+        }));
+        for (const auto& issue : response.GetResponse().GetEntry().GetIssues()) {
+            UNIT_ASSERT(!issue.message().Contains("table SQL was not used"));
+        }
+    }
+
+    Y_UNIT_TEST(SqlTableInvalidUsesProto) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        ui64 txId = 100;
+        runtime.GetAppData().FeatureFlags.SetEnableFsBackups(true);
+
+        TTempBackupFiles backup;
+        backup.CreateTableBackup("backup/Table", "Table");
+        backup.AddTableCreationQuery("backup/Table", "CREATE TABLE this is not valid SQL;");
+
+        TestImport(runtime, ++txId, "/MyRoot", Sprintf(R"(
+            ImportFromFsSettings {
+              base_path: "%s"
+              items {
+                source_path: "backup/Table"
+                destination_path: "/MyRoot/RestoredTable"
+              }
+            }
+        )", backup.GetBasePath().c_str()));
+        env.TestWaitNotification(runtime, txId);
+
+        const auto response = TestGetImport(runtime, txId, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        const auto describe = DescribePath(runtime, "/MyRoot/RestoredTable");
+        UNIT_ASSERT_VALUES_EQUAL(describe.GetPathDescription().GetTable().ColumnsSize(), 2);
+        UNIT_ASSERT(AnyOf(response.GetResponse().GetEntry().GetIssues(), [](const auto& issue) {
+            return issue.message().Contains("table SQL was not used");
+        }));
     }
 
     Y_UNIT_TEST(ShouldAcceptNoAclForFs) {

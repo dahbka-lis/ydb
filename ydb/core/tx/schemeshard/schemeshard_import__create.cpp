@@ -5,6 +5,7 @@
 #include "schemeshard_import_getters.h"
 #include "schemeshard_import_helpers.h"
 #include "schemeshard_import_scheme_query_executor.h"
+#include "schemeshard_import_table_scheme.h"
 #include "schemeshard_xxport__helpers.h"
 #include "schemeshard_xxport__tx_base.h"
 
@@ -32,6 +33,9 @@
 #include <util/generic/ptr.h>
 #include <util/generic/xrange.h>
 #include <util/string/builder.h>
+
+#include <concepts>
+#include <string_view>
 
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::IMPORT
 
@@ -61,11 +65,22 @@ bool PrepareNextBuildableIndex(const TImportInfo& importInfo, ui32 itemIdx, TIte
         return false;
     }
 
-    while (item.NextIndexIdx < item.Table->indexes_size() &&
-           NTableIndex::IsLocalTableIndex(item.Table->indexes(item.NextIndexIdx).type_case())) {
-        ++item.NextIndexIdx;
+    if (item.UsesSqlSchema()) {
+        const auto& indexes = item.TableSchemaPlan->GetIndexes();
+        while (item.NextIndexIdx < indexes.size()) {
+            if (IsLocalIndexType(indexes.Get(item.NextIndexIdx).GetType())) {
+                ++item.NextIndexIdx;
+                continue;
+            }
+            break;
+        }
+        return item.NextIndexIdx < indexes.size();
     }
 
+    while (item.NextIndexIdx < item.Table->indexes_size()
+        && NTableIndex::IsLocalTableIndex(item.Table->indexes(item.NextIndexIdx).type_case())) {
+        ++item.NextIndexIdx;
+    }
     return item.NextIndexIdx < item.Table->indexes_size();
 }
 
@@ -88,9 +103,108 @@ bool AllDoneOrWaiting(const THashMap<EState, int>& stateCounts) {
     });
 }
 
-// the item is to be created by query, i.e. it is not a table
+int CountWaitingSchemeObjects(const TVector<TItem>& items) {
+    return static_cast<int>(CountIf(items, [](const TItem& item) {
+        return item.State == EState::Waiting
+            && (item.UsesSqlSchema() || item.IsLegacyQueryObject());
+    }));
+}
+
+// Legacy query-created objects are not tables. SQL tables have their own
+// durable statement plan and must continue through data restore.
 bool IsCreatedByQuery(const TItem& item) {
-    return !item.CreationQuery.empty();
+    return item.IsLegacyQueryObject();
+}
+
+TString WithTableFallbackContext(const TItem& item, TString error) {
+    if (item.TableSchemaPlan
+        && item.TableSchemaPlan->GetSource()
+            == NKikimrImport::TTableSchemaImportPlan::SCHEMA_SOURCE_PROTOBUF
+        && item.TableSchemaPlan->GetFallbackReason()) {
+        return TStringBuilder()
+            << "table SQL candidate failed: "
+            << item.TableSchemaPlan->GetFallbackReason()
+            << "; protobuf candidate failed: " << error;
+    }
+    return error;
+}
+
+using TTableSchemaPlan = NKikimrImport::TTableSchemaImportPlan;
+
+TMaybe<ui32> FindSqlStatement(
+    const TTableSchemaPlan& plan,
+    TTableSchemaPlan::EPhase phase,
+    ui32 begin)
+{
+    for (ui32 index = begin; index < static_cast<ui32>(plan.StatementsSize()); ++index) {
+        if (plan.GetStatements(index).GetPhase() == phase) {
+            return index;
+        }
+    }
+    return Nothing();
+}
+
+bool IsSqlBaseCreate(const TItem& item) {
+    if (!item.UsesSqlSchema() || !item.TableSchemaPlan
+        || item.TableSchemaPlan->GetStatementCursor() >= static_cast<ui32>(item.TableSchemaPlan->StatementsSize())) {
+        return false;
+    }
+    return item.TableSchemaPlan->GetStatements(item.TableSchemaPlan->GetStatementCursor()).GetKind()
+        == TTableSchemaPlan::STATEMENT_KIND_CREATE_TABLE;
+}
+
+TMaybe<TVector<TString>> SqlIndexImplTableNames(
+    const NKikimrSchemeOp::TIndexCreationConfig& index)
+{
+    if (IsLocalIndexType(index.GetType())) {
+        return TVector<TString>{};
+    }
+    switch (index.GetType()) {
+        case NKikimrSchemeOp::EIndexTypeGlobal:
+        case NKikimrSchemeOp::EIndexTypeGlobalAsync:
+        case NKikimrSchemeOp::EIndexTypeGlobalUnique:
+        case NKikimrSchemeOp::EIndexTypeGlobalVectorKmeansTree:
+        case NKikimrSchemeOp::EIndexTypeGlobalFulltextPlain:
+        case NKikimrSchemeOp::EIndexTypeGlobalFulltextRelevance:
+        case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompact:
+        case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompactRelevance:
+        case NKikimrSchemeOp::EIndexTypeGlobalJson:
+        case NKikimrSchemeOp::EIndexTypeGlobalJsonCompact: {
+            const TVector<TString> keyColumns(
+                index.GetKeyColumnNames().begin(), index.GetKeyColumnNames().end());
+            const auto implTables = NTableIndex::GetImplTables(index.GetType(), keyColumns);
+            TVector<TString> result;
+            result.reserve(implTables.size());
+            for (const std::string_view implTable : implTables) {
+                result.emplace_back(implTable.data(), implTable.size());
+            }
+            return result;
+        }
+        default:
+            return Nothing();
+    }
+}
+
+bool CanFallbackAfterPreparationFailure(Ydb::StatusIds::StatusCode status) {
+    return IsIn({
+        Ydb::StatusIds::BAD_REQUEST,
+        Ydb::StatusIds::PRECONDITION_FAILED,
+        Ydb::StatusIds::UNSUPPORTED,
+    }, status);
+}
+
+bool CanFallbackAfterProposalFailure(NKikimrScheme::EStatus status) {
+    return IsIn({
+        NKikimrScheme::StatusInvalidParameter,
+        NKikimrScheme::StatusPreconditionFailed,
+    }, status);
+}
+
+bool ShouldRetrySqlBaseProposal(NKikimrScheme::EStatus status) {
+    return IsIn({
+        NKikimrScheme::StatusSchemeError,
+        NKikimrScheme::StatusPathDoesNotExist,
+    }, status);
 }
 
 bool IsCreateViewQuery(const TString& query) {
@@ -485,6 +599,7 @@ struct TSchemeShard::TImport::TTxProgress: public TSchemeShard::TXxport::TTxBase
     TEvSchemeShard::TEvModifySchemeTransactionResult::TPtr ModifyResult = nullptr;
     TEvIndexBuilder::TEvCreateResponse::TPtr CreateIndexResult = nullptr;
     TTxId CompletedTxId = InvalidTxId;
+    bool DeferCancellationCompletion = false;
 
     explicit TTxProgress(TSelf* self, ui64 id, const TMaybe<ui32>& itemIdx)
         : TXxport::TTxBase(self)
@@ -578,7 +693,8 @@ private:
             {"item", item.ToString(itemIdx)},
         );
 
-        item.SchemeGetter = ctx.RegisterWithSameMailbox(CreateSchemeGetter(Self->SelfId(), importInfo, itemIdx, item.ExportItemIV));
+        item.SchemeGetter = ctx.RegisterWithSameMailbox(CreateSchemeGetter(
+            Self->SelfId(), importInfo, itemIdx, item.ExportItemIV, GetDatabase(*Self)));
         Self->RunningImportSchemeGetters.emplace(item.SchemeGetter);
     }
 
@@ -591,12 +707,10 @@ private:
         Self->RunningImportSchemeGetters.emplace(importInfo->SchemaMappingGetter);
     }
 
-    void CreateTable(TImportInfo& importInfo, ui32 itemIdx, TTxId txId) {
+    bool CreateTable(TImportInfo& importInfo, ui32 itemIdx, TTxId txId, TString& error) {
         Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
         auto& item = importInfo.Items.at(itemIdx);
         Y_ABORT_UNLESS(item.Table);
-
-        item.SubState = ESubState::Proposed;
 
         YDB_LOG_INFO("TImport::TTxProgress: CreateTable propose",
             {"info", importInfo.ToString()},
@@ -606,10 +720,488 @@ private:
 
         Y_ABORT_UNLESS(item.WaitTxId == InvalidTxId);
 
-        auto propose = CreateTablePropose(Self, txId, importInfo, itemIdx);
-        Y_ABORT_UNLESS(propose);
+        auto propose = CreateTablePropose(Self, txId, importInfo, itemIdx, error);
+        if (!propose) {
+            return false;
+        }
 
+        item.SubState = ESubState::Proposed;
         Send(Self->SelfId(), std::move(propose));
+        return true;
+    }
+
+    void PrepareCurrentSqlOperation(
+        NIceDb::TNiceDb& db,
+        TImportInfo::TPtr importInfo,
+        ui32 itemIdx,
+        const TActorContext& ctx)
+    {
+        Y_ABORT_UNLESS(itemIdx < importInfo->Items.size());
+        auto& item = importInfo->Items[itemIdx];
+        Y_ABORT_UNLESS(item.UsesSqlSchema());
+        auto& plan = *item.TableSchemaPlan;
+        Y_ABORT_UNLESS(plan.GetStatementCursor() < static_cast<ui32>(plan.StatementsSize()));
+        auto* statement = plan.MutableStatements(plan.GetStatementCursor());
+        plan.SetCurrentOperationAccepted(false);
+
+        if (plan.GetOperationCursor() < static_cast<ui32>(statement->PreparedOperationsSize())) {
+            item.PreparedCreationQuery = statement->GetPreparedOperations(plan.GetOperationCursor());
+            Self->PersistImportItemPreparedCreationQuery(db, *importInfo, itemIdx);
+            Self->PersistImportItemTableSchemaPlan(db, *importInfo, itemIdx);
+            AllocateTxId(*importInfo, itemIdx);
+            return;
+        }
+
+        item.PreparedCreationQuery.Clear();
+        plan.SetOperationCursor(0);
+        plan.SetPreparationAttempt(plan.GetPreparationAttempt() + 1);
+        Self->PersistImportItemPreparedCreationQuery(db, *importInfo, itemIdx);
+        Self->PersistImportItemTableSchemaPlan(db, *importInfo, itemIdx);
+
+        item.SchemeQueryExecutor = ctx.Register(CreateSchemeQueryExecutor(
+            Self->SelfId(), importInfo->Id, itemIdx, statement->GetSql(), GetDatabase(*Self),
+            statement->GetKind(), statement->GetOrdinal(), plan.GetPreparationAttempt()));
+        Self->RunningImportSchemeQueryExecutors.emplace(item.SchemeQueryExecutor);
+    }
+
+    bool BeginSqlPhase(
+        NIceDb::TNiceDb& db,
+        TImportInfo::TPtr importInfo,
+        ui32 itemIdx,
+        TTableSchemaPlan::EPhase phase,
+        const TActorContext& ctx)
+    {
+        auto& item = importInfo->Items[itemIdx];
+        auto& plan = *item.TableSchemaPlan;
+        plan.SetPhase(phase);
+        plan.SetOperationCursor(0);
+        plan.SetCurrentOperationAccepted(false);
+        item.PreparedCreationQuery.Clear();
+
+        if (const auto next = FindSqlStatement(plan, phase, 0)) {
+            plan.SetStatementCursor(*next);
+            item.State = EState::CreateSchemeObject;
+            Self->PersistImportItemState(db, *importInfo, itemIdx);
+            Self->PersistImportItemPreparedCreationQuery(db, *importInfo, itemIdx);
+            Self->PersistImportItemTableSchemaPlan(db, *importInfo, itemIdx);
+            PrepareCurrentSqlOperation(db, importInfo, itemIdx, ctx);
+            return true;
+        } else {
+            Self->PersistImportItemPreparedCreationQuery(db, *importInfo, itemIdx);
+            Self->PersistImportItemTableSchemaPlan(db, *importInfo, itemIdx);
+            return false;
+        }
+    }
+
+    void FinishSqlPhase(
+        NIceDb::TNiceDb& db,
+        TImportInfo::TPtr importInfo,
+        ui32 itemIdx,
+        const TActorContext& ctx)
+    {
+        auto& item = importInfo->Items[itemIdx];
+        auto& plan = *item.TableSchemaPlan;
+
+        switch (plan.GetPhase()) {
+            case TTableSchemaPlan::PHASE_BEFORE_DATA:
+                if (!item.DstPathId) {
+                    UpdateItemDstPathId(db, *importInfo, itemIdx);
+                }
+                for (const ui32 childIdx : item.ChildItems) {
+                    auto& child = importInfo->Items.at(childIdx);
+                    if (child.State == EState::Done) {
+                        continue;
+                    }
+                    UpdateItemDstPathId(db, *importInfo, childIdx);
+                    child.State = EState::Transferring;
+                    Self->PersistImportItemState(db, *importInfo, childIdx);
+                    AllocateTxId(*importInfo, childIdx);
+                }
+                item.State = EState::Transferring;
+                Self->PersistImportItemState(db, *importInfo, itemIdx);
+                AllocateTxId(*importInfo, itemIdx);
+                break;
+
+            case TTableSchemaPlan::PHASE_AFTER_INDEXES:
+                if (AppData()->FeatureFlags.GetEnableChangefeedsImport()
+                    && BeginSqlPhase(db, importInfo, itemIdx, TTableSchemaPlan::PHASE_CHANGEFEEDS, ctx)) {
+                    break;
+                }
+                item.State = EState::Done;
+                Self->PersistImportItemState(db, *importInfo, itemIdx);
+                break;
+
+            case TTableSchemaPlan::PHASE_CHANGEFEEDS:
+                if (TString error; !FilterSqlChangefeeds(db, *importInfo, itemIdx, error)) {
+                    return CancelAndPersist(
+                        db, importInfo, itemIdx, error,
+                        "incomplete SQL changefeed backup");
+                }
+                if (item.NextChangefeedIdx < item.Changefeeds.GetChangefeeds().size()) {
+                    item.State = EState::CreateChangefeed;
+                    item.ChangefeedState = TItem::EChangefeedState::CreateConsumers;
+                    plan.SetCurrentOperationAccepted(false);
+                    Self->PersistImportItemTableSchemaPlan(db, *importInfo, itemIdx);
+                    Self->PersistImportItemState(db, *importInfo, itemIdx);
+                    AllocateTxId(*importInfo, itemIdx);
+                } else {
+                    item.State = EState::Done;
+                    Self->PersistImportItemState(db, *importInfo, itemIdx);
+                }
+                break;
+        }
+    }
+
+    bool HasPendingMaterializedChildren(const TImportInfo& importInfo, const TItem& item) const {
+        return AnyOf(item.ChildItems, [&](ui32 childIdx) {
+            return childIdx < importInfo.Items.size()
+                && importInfo.Items[childIdx].State != EState::Done;
+        });
+    }
+
+    void ContinueSqlTableAfterData(
+        NIceDb::TNiceDb& db,
+        TImportInfo::TPtr importInfo,
+        ui32 itemIdx,
+        const TActorContext& ctx)
+    {
+        auto& item = importInfo->Items.at(itemIdx);
+        Y_ABORT_UNLESS(item.UsesSqlSchema());
+
+        if (HasPendingMaterializedChildren(*importInfo, item)) {
+            item.State = EState::WaitingForIndexData;
+            Self->PersistImportItemState(db, *importInfo, itemIdx);
+            return;
+        }
+
+        if (PrepareNextBuildableIndex(*importInfo, itemIdx, item)) {
+            item.State = EState::BuildIndexes;
+            Self->PersistImportItemState(db, *importInfo, itemIdx);
+            AllocateTxId(*importInfo, itemIdx);
+        } else if (!BeginSqlPhase(
+                db, importInfo, itemIdx, TTableSchemaPlan::PHASE_AFTER_INDEXES, ctx)) {
+            FinishSqlPhase(db, importInfo, itemIdx, ctx);
+        }
+    }
+
+    void AdvanceSqlOperation(
+        NIceDb::TNiceDb& db,
+        TImportInfo::TPtr importInfo,
+        ui32 itemIdx,
+        const TActorContext& ctx,
+        bool continueExecution = true)
+    {
+        auto& item = importInfo->Items[itemIdx];
+        auto& plan = *item.TableSchemaPlan;
+        Y_ABORT_UNLESS(plan.GetStatementCursor() < static_cast<ui32>(plan.StatementsSize()));
+        auto* statement = plan.MutableStatements(plan.GetStatementCursor());
+
+        plan.SetFirstMutationCompleted(true);
+        plan.SetOperationCursor(plan.GetOperationCursor() + 1);
+        plan.SetCurrentOperationAccepted(false);
+        item.PreparedCreationQuery.Clear();
+        Self->PersistImportItemPreparedCreationQuery(db, *importInfo, itemIdx);
+
+        if (!continueExecution) {
+            Self->PersistImportItemTableSchemaPlan(db, *importInfo, itemIdx);
+            return;
+        }
+
+        if (plan.GetOperationCursor() < static_cast<ui32>(statement->PreparedOperationsSize())) {
+            Self->PersistImportItemTableSchemaPlan(db, *importInfo, itemIdx);
+            PrepareCurrentSqlOperation(db, importInfo, itemIdx, ctx);
+            return;
+        }
+
+        if (const auto next = FindSqlStatement(
+                plan, plan.GetPhase(), plan.GetStatementCursor() + 1)) {
+            plan.SetStatementCursor(*next);
+            plan.SetOperationCursor(0);
+            Self->PersistImportItemTableSchemaPlan(db, *importInfo, itemIdx);
+            PrepareCurrentSqlOperation(db, importInfo, itemIdx, ctx);
+            return;
+        }
+
+        Self->PersistImportItemTableSchemaPlan(db, *importInfo, itemIdx);
+        FinishSqlPhase(db, importInfo, itemIdx, ctx);
+    }
+
+    void SelectProtobufFallback(
+        NIceDb::TNiceDb& db,
+        TImportInfo::TPtr importInfo,
+        ui32 itemIdx,
+        TString reason)
+    {
+        auto& item = importInfo->Items[itemIdx];
+        Y_ABORT_UNLESS(item.CanFallbackToProtobuf());
+        const TString fallbackReason = reason;
+        if (auto actor = std::exchange(item.SchemeQueryExecutor, {})) {
+            Send(actor, new TEvents::TEvPoisonPill());
+            Self->RunningImportSchemeQueryExecutors.erase(actor);
+        }
+
+        TMaybe<ui32> expectedMaterializedChildren;
+        if (const auto& indexes = item.Metadata.GetIndexes()) {
+            expectedMaterializedChildren = static_cast<ui32>(indexes->size());
+        } else if (item.Table) {
+            ui32 count = 0;
+            bool allIndexTypesKnown = true;
+            for (const auto& index : item.Table->indexes()) {
+                const auto indexType = NTableIndex::TryConvertIndexType(
+                    index.type_case(), AppData()->FeatureFlags.GetEnableCompactFulltextIndex());
+                if (!indexType) {
+                    allIndexTypesKnown = false;
+                    break;
+                }
+                const TVector<TString> indexColumns(
+                    index.index_columns().begin(), index.index_columns().end());
+                count += static_cast<ui32>(NTableIndex::GetImplTables(*indexType, indexColumns).size());
+            }
+            if (allIndexTypesKnown) {
+                expectedMaterializedChildren = count;
+            }
+        }
+
+        const bool incompleteMaterializedBackup = expectedMaterializedChildren.Defined()
+            && item.ChildItems.size() < *expectedMaterializedChildren;
+        const bool incompleteChangefeedBackup = AnyOf(
+            item.Changefeeds.GetChangefeeds(),
+            [](const auto& changefeed) {
+                return !changefeed.HasChangefeed() || !changefeed.HasTopic();
+            });
+        const auto populationMode = importInfo->GetIndexPopulationMode();
+
+        item.ResetToProtobufSchema(std::move(reason));
+        item.NextIndexIdx = 0;
+        item.NextChangefeedIdx = 0;
+        if (incompleteMaterializedBackup
+            && populationMode == Ydb::Import::ImportFromS3Settings::INDEX_POPULATION_MODE_AUTO) {
+            item.TableSchemaPlan->SetForceBuildIndexes(true);
+        }
+
+        if ((incompleteMaterializedBackup
+                && populationMode == Ydb::Import::ImportFromS3Settings::INDEX_POPULATION_MODE_IMPORT)
+            || incompleteChangefeedBackup) {
+            Self->PersistImportItemScheme(db, *importInfo, itemIdx);
+            Self->PersistImportItemPreparedCreationQuery(db, *importInfo, itemIdx);
+            return CancelAndPersist(
+                db,
+                importInfo,
+                itemIdx,
+                TStringBuilder() << "table SQL candidate failed: " << fallbackReason
+                    << "; protobuf candidate failed: required "
+                    << (incompleteChangefeedBackup ? "changefeed" : "materialized index")
+                    << " backup is incomplete",
+                "cannot select protobuf table fallback");
+        }
+
+        for (const ui32 childIdx : item.ChildItems) {
+            auto& child = importInfo->Items.at(childIdx);
+            child.State = ShouldRestoreIndexImplementationData(
+                    populationMode, incompleteMaterializedBackup)
+                ? EState::Waiting
+                : EState::Done;
+            child.WaitTxId = InvalidTxId;
+            child.Issue.clear();
+            Self->PersistImportItemState(db, *importInfo, childIdx);
+        }
+
+        item.State = EState::CreateSchemeObject;
+        item.SubState = ESubState::AllocateTxId;
+        Self->PersistImportItemScheme(db, *importInfo, itemIdx);
+        Self->PersistImportItemPreparedCreationQuery(db, *importInfo, itemIdx);
+        Self->PersistImportItemState(db, *importInfo, itemIdx);
+        AllocateTxId(*importInfo, itemIdx);
+    }
+
+    bool NormalizeSqlIndexSettingsPhases(
+        TImportInfo& importInfo,
+        ui32 itemIdx,
+        TString& error)
+    {
+        auto& item = importInfo.Items.at(itemIdx);
+        auto& plan = *item.TableSchemaPlan;
+        for (auto& statement : *plan.MutableStatements()) {
+            if (!statement.GetPopulationDependentIndexSettings()) {
+                continue;
+            }
+
+            const auto index = FindIf(plan.GetIndexes(), [&](const auto& candidate) {
+                return candidate.GetName() == statement.GetIndexName();
+            });
+            if (index == plan.GetIndexes().end()) {
+                error = TStringBuilder() << "ALTER INDEX refers to unknown SQL index "
+                    << statement.GetIndexName().Quote();
+                return false;
+            }
+
+            const bool buildBeforeSettings = !IsLocalIndexType(index->GetType())
+                && NeedToBuildIndexes(importInfo, itemIdx);
+            statement.SetPhase(buildBeforeSettings
+                ? TTableSchemaPlan::PHASE_AFTER_INDEXES
+                : TTableSchemaPlan::PHASE_BEFORE_DATA);
+        }
+        return true;
+    }
+
+    bool FilterSqlMaterializedChildren(
+        NIceDb::TNiceDb& db,
+        TImportInfo& importInfo,
+        ui32 itemIdx,
+        TString& error,
+        bool& canFallback)
+    {
+        auto& item = importInfo.Items[itemIdx];
+        Y_ABORT_UNLESS(item.TableSchemaPlan);
+        canFallback = false;
+        const auto populationMode = importInfo.GetIndexPopulationMode();
+        if (populationMode
+            == Ydb::Import::ImportFromS3Settings::INDEX_POPULATION_MODE_BUILD) {
+            for (const ui32 childIdx : item.ChildItems) {
+                auto& child = importInfo.Items.at(childIdx);
+                child.State = EState::Done;
+                child.Issue.clear();
+                Self->PersistImportItemState(db, importInfo, childIdx);
+            }
+            if (!NormalizeSqlIndexSettingsPhases(importInfo, itemIdx, error)) {
+                canFallback = true;
+                return false;
+            }
+            return true;
+        }
+
+        TVector<std::pair<TString, TVector<TString>>> expectedPathsByIndex;
+        THashSet<TString> expectedPaths;
+        for (const auto& index : item.TableSchemaPlan->GetIndexes()) {
+            const auto implTableNames = SqlIndexImplTableNames(index);
+            if (!implTableNames) {
+                canFallback = true;
+                error = TStringBuilder() << "SQL index " << index.GetName().Quote()
+                    << " has unsupported type " << static_cast<ui32>(index.GetType());
+                return false;
+            }
+
+            TVector<TString> indexPaths;
+            indexPaths.reserve(implTableNames->size());
+            for (const auto& implTableName : *implTableNames) {
+                TString path = TStringBuilder() << item.DstPathName << '/'
+                    << index.GetName() << '/' << implTableName;
+                if (!expectedPaths.insert(path).second) {
+                    canFallback = true;
+                    error = TStringBuilder() << "SQL index implementation path "
+                        << path.Quote() << " is not unique";
+                    return false;
+                }
+                indexPaths.push_back(std::move(path));
+            }
+            expectedPathsByIndex.emplace_back(index.GetName(), std::move(indexPaths));
+        }
+
+        THashSet<TString> availablePaths;
+        for (const ui32 childIdx : item.ChildItems) {
+            auto& child = importInfo.Items.at(childIdx);
+            if (expectedPaths.contains(child.DstPathName)) {
+                if (!availablePaths.insert(child.DstPathName).second) {
+                    error = TStringBuilder() << "materialized index implementation path "
+                        << child.DstPathName.Quote()
+                        << " occurs more than once in backup metadata";
+                    return false;
+                }
+            } else {
+                child.State = EState::Done;
+                child.Issue.clear();
+                Self->PersistImportItemState(db, importInfo, childIdx);
+            }
+        }
+
+        bool missingSelectedData = false;
+        for (const auto& [indexName, indexPaths] : expectedPathsByIndex) {
+            if (AnyOf(indexPaths, [&](const TString& path) {
+                    return !availablePaths.contains(path);
+                })) {
+                missingSelectedData = true;
+                if (populationMode
+                    == Ydb::Import::ImportFromS3Settings::INDEX_POPULATION_MODE_IMPORT) {
+                    error = TStringBuilder() << "SQL index " << indexName.Quote()
+                        << " has no complete materialized backup";
+                    return false;
+                }
+            }
+        }
+
+        if (missingSelectedData
+            && populationMode
+                == Ydb::Import::ImportFromS3Settings::INDEX_POPULATION_MODE_AUTO) {
+            item.TableSchemaPlan->SetForceBuildIndexes(true);
+            for (const ui32 childIdx : item.ChildItems) {
+                auto& child = importInfo.Items.at(childIdx);
+                child.State = EState::Done;
+                child.Issue.clear();
+                Self->PersistImportItemState(db, importInfo, childIdx);
+            }
+        }
+        if (!NormalizeSqlIndexSettingsPhases(importInfo, itemIdx, error)) {
+            canFallback = true;
+            return false;
+        }
+        return true;
+    }
+
+    bool FilterSqlChangefeeds(
+        NIceDb::TNiceDb& db,
+        TImportInfo& importInfo,
+        ui32 itemIdx,
+        TString& error)
+    {
+        auto& item = importInfo.Items[itemIdx];
+        THashSet<TString> selectedStreams;
+        for (const auto& statement : item.TableSchemaPlan->GetStatements()) {
+            if (statement.GetPhase() != TTableSchemaPlan::PHASE_CHANGEFEEDS) {
+                continue;
+            }
+            for (const auto& operation : statement.GetPreparedOperations()) {
+                if (operation.GetOperationType() == NKikimrSchemeOp::ESchemeOpCreateCdcStream) {
+                    selectedStreams.insert(
+                        operation.GetCreateCdcStream().GetStreamDescription().GetName());
+                }
+            }
+        }
+
+        NKikimrSchemeOp::TImportTableChangefeeds selected;
+        THashSet<TString> matchedStreams;
+        for (const auto& changefeed : item.Changefeeds.GetChangefeeds()) {
+            if (!changefeed.HasChangefeed()) {
+                continue;
+            }
+            const TString& name = changefeed.GetChangefeed().name();
+            if (!selectedStreams.contains(name)) {
+                if (matchedStreams.contains(name)) {
+                    error = TStringBuilder() << "SQL changefeed " << name.Quote()
+                        << " occurs more than once in backup metadata";
+                    return false;
+                }
+                continue;
+            }
+            if (!changefeed.HasTopic()) {
+                error = TStringBuilder() << "SQL changefeed " << name.Quote()
+                    << " has no required consumer sidecar";
+                return false;
+            }
+            *selected.AddChangefeeds() = changefeed;
+            matchedStreams.insert(name);
+            selectedStreams.erase(name);
+        }
+        if (!selectedStreams.empty()) {
+            const TString& missingStream = *selectedStreams.begin();
+            error = TStringBuilder() << "SQL changefeed "
+                << missingStream.Quote()
+                << " has no required consumer sidecar";
+            return false;
+        }
+        item.Changefeeds = std::move(selected);
+        item.NextChangefeedIdx = 0;
+        Self->PersistImportItemScheme(db, importInfo, itemIdx);
+        return true;
     }
 
     void ProcessSysViewRestore(TTransactionContext& txc, TImportInfo::TPtr importInfo, ui32 itemIdx, const TActorContext& ctx) {
@@ -683,8 +1275,6 @@ private:
         auto& item = importInfo.Items.at(itemIdx);
         Y_ABORT_UNLESS(item.SysView);
 
-        item.SubState = ESubState::Proposed;
-
         YDB_LOG_INFO("TImport::TTxProgress: RestoreSysViewPermissions propose",
             {"info", importInfo.ToString()},
             {"item", item.ToString(itemIdx)},
@@ -697,7 +1287,7 @@ private:
         Y_ABORT_UNLESS(path);
 
         // Only restore permissions, don't create the system view itself
-        auto propose = MakeHolder<TEvSchemeShard::TEvModifySchemeTransaction>(ui64(txId), Self->TabletID());
+        auto propose = MakeModifySchemeTransaction(Self, txId, importInfo);
         auto& record = propose->Record;
 
         auto& modifyScheme = *record.AddTransaction();
@@ -715,6 +1305,7 @@ private:
             op.SetNewOwner(BUILTIN_ACL_METADATA);
         }
 
+        item.SubState = ESubState::Proposed;
         Send(Self->SelfId(), std::move(propose));
         return true;
     }
@@ -722,8 +1313,6 @@ private:
     bool CreateTopic(TImportInfo& importInfo, ui32 itemIdx, TTxId txId, TString& error) {
         Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
         auto& item = importInfo.Items.at(itemIdx);
-
-        item.SubState = ESubState::Proposed;
 
         YDB_LOG_INFO("TImport::TTxProgress: CreateTopic propose",
             {"info", importInfo.ToString()},
@@ -738,15 +1327,14 @@ private:
             return false;
         }
 
+        item.SubState = ESubState::Proposed;
         Send(Self->SelfId(), std::move(propose));
         return true;
     }
 
-    void ExecutePreparedQuery(TTransactionContext& txc, TImportInfo::TPtr importInfo, ui32 itemIdx, TTxId txId) {
+    bool ExecutePreparedQuery(TTransactionContext& txc, TImportInfo::TPtr importInfo, ui32 itemIdx, TTxId txId) {
         Y_ABORT_UNLESS(itemIdx < importInfo->Items.size());
         auto& item = importInfo->Items[itemIdx];
-
-        item.SubState = ESubState::Proposed;
 
         YDB_LOG_INFO("TImport::TTxProgress: ExecutePreparedQuery",
             {"info", importInfo->ToString()},
@@ -754,28 +1342,51 @@ private:
             {"txId", txId},
         );
 
-        Y_ABORT_UNLESS(item.WaitTxId == InvalidTxId);
+        const bool retryUnknownSqlProposal = item.UsesSqlSchema()
+            && item.WaitTxId == txId
+            && !item.TableSchemaPlan->GetCurrentOperationAccepted();
+        Y_ABORT_UNLESS(item.WaitTxId == InvalidTxId || retryUnknownSqlProposal);
 
-        auto propose = MakeHolder<TEvSchemeShard::TEvModifySchemeTransaction>(ui64(txId), Self->TabletID());
+        auto propose = MakeModifySchemeTransaction(Self, txId, *importInfo);
         auto& record = propose->Record;
 
         auto& modifyScheme = *record.AddTransaction();
         modifyScheme = *item.PreparedCreationQuery;
         modifyScheme.SetInternal(true);
 
-        if (importInfo->UserSID) {
-            record.SetOwner(*importInfo->UserSID);
+        const auto operationType = modifyScheme.GetOperationType();
+        const bool isTableCreateOperation = IsIn({
+            NKikimrSchemeOp::ESchemeOpCreateTable,
+            NKikimrSchemeOp::ESchemeOpCreateIndexedTable,
+            NKikimrSchemeOp::ESchemeOpCreateColumnTable,
+        }, operationType);
+        const bool applyTablePermissions = !item.UsesSqlSchema()
+            || (IsSqlBaseCreate(item) && isTableCreateOperation);
+        if (applyTablePermissions) {
+            FillOwner(record, item.Permissions);
         }
-        FillOwner(record, item.Permissions);
 
         record.SetOwner(ChooseAppropriateOwner(record, AppData()));
 
-        if (TString error; !FillACL(modifyScheme, item.Permissions, error)) {
+        if (TString error; applyTablePermissions && !FillACL(modifyScheme, item.Permissions, error)) {
             NIceDb::TNiceDb db(txc.DB);
-            return CancelAndPersist(db, importInfo, itemIdx, error, "cannot parse permissions");
+            CancelAndPersist(db, importInfo, itemIdx, error, "cannot parse permissions");
+            return false;
+        }
+
+        item.SubState = ESubState::Proposed;
+        if (item.UsesSqlSchema() && item.WaitTxId == InvalidTxId) {
+            // The durable tx identity closes the fallback fence before the
+            // proposal can be accepted. A reboot either retries this exact tx
+            // or subscribes to it after CurrentOperationAccepted is durable.
+            item.WaitTxId = txId;
+            NIceDb::TNiceDb db(txc.DB);
+            Self->PersistImportItemState(db, *importInfo, itemIdx);
+            Self->PersistImportItemTableSchemaPlan(db, *importInfo, itemIdx);
         }
 
         Send(Self->SelfId(), std::move(propose));
+        return true;
     }
 
     void DelayObjectCreation(
@@ -798,50 +1409,71 @@ private:
 
         const auto stateCounts = CountItemsByState(importInfo->Items);
         if (AllDoneOrWaiting(stateCounts)) {
-            if (stateCounts.at(EState::Waiting) == importInfo->WaitingSchemeObjects) {
+            if (CountWaitingSchemeObjects(importInfo->Items) == importInfo->WaitingSchemeObjects) {
                 // No progress has been made since the last scheme object creation retry.
-                return CancelAndPersist(db, importInfo, itemIdx, error, "creation query failed, no progress");
+                if (item.UsesSqlSchema() && IsSqlBaseCreate(item)
+                    && item.CanFallbackToProtobuf()) {
+                    return SelectProtobufFallback(
+                        db,
+                        importInfo,
+                        itemIdx,
+                        TStringBuilder() << "SQL CREATE dependency resolution made no progress: "
+                            << error);
+                }
+                return CancelAndPersist(
+                    db, importInfo, itemIdx,
+                    WithTableFallbackContext(item, error),
+                    "creation query failed, no progress");
             }
-            RetrySchemeObjectsQueryExecution(*importInfo, db, ctx);
+            RetrySchemeObjectsQueryExecution(importInfo, db, ctx);
         }
     }
 
-    void RetrySchemeObjectsQueryExecution(TImportInfo& importInfo, NIceDb::TNiceDb& db, const TActorContext& ctx) {
+    void RetrySchemeObjectsQueryExecution(TImportInfo::TPtr importInfo, NIceDb::TNiceDb& db, const TActorContext& ctx) {
         const auto database = GetDatabase(*Self);
         TVector<ui32> retriedItems;
-        for (ui32 itemIdx : xrange(importInfo.Items.size())) {
-            auto& item = importInfo.Items[itemIdx];
-            if (item.State != EState::Waiting || !IsCreatedByQuery(item)) {
+        for (ui32 itemIdx : xrange(importInfo->Items.size())) {
+            auto& item = importInfo->Items[itemIdx];
+            if (item.State != EState::Waiting) {
                 continue;
             }
-            if (item.PreparedCreationQuery) {
-                AllocateTxId(importInfo, itemIdx);
-            } else {
+
+            if (item.UsesSqlSchema()) {
+                item.State = EState::CreateSchemeObject;
+                Self->PersistImportItemState(db, *importInfo, itemIdx);
+                if (item.PreparedCreationQuery) {
+                    AllocateTxId(*importInfo, itemIdx);
+                } else {
+                    PrepareCurrentSqlOperation(db, importInfo, itemIdx, ctx);
+                }
+            } else if (IsCreatedByQuery(item) && item.PreparedCreationQuery) {
+                AllocateTxId(*importInfo, itemIdx);
+            } else if (IsCreatedByQuery(item)) {
                 item.SchemeQueryExecutor = ctx.Register(CreateSchemeQueryExecutor(
-                    Self->SelfId(), importInfo.Id, itemIdx, item.CreationQuery, database
+                    Self->SelfId(), importInfo->Id, itemIdx, item.CreationQuery, database
                 ));
                 Self->RunningImportSchemeQueryExecutors.emplace(item.SchemeQueryExecutor);
+            } else {
+                continue;
             }
 
             item.State = EState::CreateSchemeObject;
-            Self->PersistImportItemState(db, importInfo, itemIdx);
+            Self->PersistImportItemState(db, *importInfo, itemIdx);
 
             retriedItems.emplace_back(itemIdx);
         }
         if (!retriedItems.empty()) {
-            importInfo.WaitingSchemeObjects = std::ssize(retriedItems);
+            importInfo->WaitingSchemeObjects = std::ssize(retriedItems);
             YDB_LOG_DEBUG("TImport::TTxProgress: retry scheme object query execution",
-                {"id", importInfo.Id},
+                {"id", importInfo->Id},
                 {"retriedItems", JoinSeq(", ", retriedItems)},
             );
         }
     }
 
-    void TransferData(TImportInfo& importInfo, ui32 itemIdx, TTxId txId) {
+    bool TransferData(TImportInfo& importInfo, ui32 itemIdx, TTxId txId, TString& error) {
         Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
         auto& item = importInfo.Items.at(itemIdx);
-
-        item.SubState = ESubState::Proposed;
 
         YDB_LOG_INFO("TImport::TTxProgress: Restore propose",
             {"info", importInfo.ToString()},
@@ -850,7 +1482,13 @@ private:
         );
 
         Y_ABORT_UNLESS(item.WaitTxId == InvalidTxId);
-        Send(Self->SelfId(), RestoreTableDataPropose(Self, txId, importInfo, itemIdx));
+        auto propose = RestoreTableDataPropose(Self, txId, importInfo, itemIdx, error);
+        if (!propose) {
+            return false;
+        }
+        item.SubState = ESubState::Proposed;
+        Send(Self->SelfId(), std::move(propose));
+        return true;
     }
 
     bool CancelTransferring(TImportInfo& importInfo, ui32 itemIdx) {
@@ -876,11 +1514,9 @@ private:
         return true;
     }
 
-    void BuildIndex(TImportInfo& importInfo, ui32 itemIdx, TTxId txId) {
+    bool BuildIndex(TImportInfo& importInfo, ui32 itemIdx, TTxId txId, TString& error) {
         Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
         auto& item = importInfo.Items.at(itemIdx);
-
-        item.SubState = ESubState::Proposed;
 
         YDB_LOG_INFO("TImport::TTxProgress: build index",
             {"info", importInfo.ToString()},
@@ -889,7 +1525,14 @@ private:
         );
 
         Y_ABORT_UNLESS(item.WaitTxId == InvalidTxId);
-        Send(Self->SelfId(), BuildIndexPropose(Self, txId, importInfo, itemIdx, MakeIndexBuildUid(importInfo, itemIdx)));
+        auto propose = BuildIndexPropose(
+            Self, txId, importInfo, itemIdx, MakeIndexBuildUid(importInfo, itemIdx), error);
+        if (!propose) {
+            return false;
+        }
+        item.SubState = ESubState::Proposed;
+        Send(Self->SelfId(), std::move(propose));
+        return true;
     }
 
     bool CancelIndexBuilding(TImportInfo& importInfo, ui32 itemIdx) {
@@ -918,8 +1561,6 @@ private:
     bool CreateChangefeed(TImportInfo& importInfo, ui32 itemIdx, TTxId txId, TString& error) {
         Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
         auto& item = importInfo.Items.at(itemIdx);
-        item.SubState = ESubState::Proposed;
-
         YDB_LOG_INFO("TImport::TTxProgress: CreateChangefeed propose",
             {"info", importInfo.ToString()},
             {"item", item.ToString(itemIdx)},
@@ -933,6 +1574,7 @@ private:
             return false;
         }
 
+        item.SubState = ESubState::Proposed;
         Send(Self->SelfId(), std::move(propose));
         return true;
     }
@@ -948,9 +1590,66 @@ private:
             {"txId", txId},
         );
 
-        Y_ABORT_UNLESS(item.WaitTxId == InvalidTxId);
+        Y_ABORT_UNLESS(item.WaitTxId == InvalidTxId
+            || (item.UsesSqlSchema() && item.WaitTxId == txId
+                && !item.TableSchemaPlan->GetCurrentOperationAccepted()));
 
         Send(Self->SelfId(), CreateConsumersPropose(Self, txId, importInfo, item));
+    }
+
+    void AdvanceChangefeedAfterCompletion(
+        NIceDb::TNiceDb& db,
+        TImportInfo::TPtr importInfo,
+        ui32 itemIdx)
+    {
+        Y_ABORT_UNLESS(itemIdx < importInfo->Items.size());
+        auto& item = importInfo->Items.at(itemIdx);
+        Y_ABORT_UNLESS(item.State == EState::CreateChangefeed);
+
+        if (item.UsesSqlSchema()) {
+            // SQL owns creation and topic settings. The legacy sidecars are used
+            // only to restore consumers, so every selected stream resumes at the
+            // consumer step instead of attempting another CREATE CHANGEFEED.
+            item.ChangefeedState = TItem::EChangefeedState::CreateConsumers;
+            item.TableSchemaPlan->SetCurrentOperationAccepted(false);
+            Self->PersistImportItemTableSchemaPlan(db, *importInfo, itemIdx);
+            if (++item.NextChangefeedIdx < item.Changefeeds.GetChangefeeds().size()) {
+                AllocateTxId(*importInfo, itemIdx);
+            } else {
+                item.State = EState::Done;
+            }
+            return;
+        }
+
+        if (item.ChangefeedState == TItem::EChangefeedState::CreateChangefeed) {
+            item.ChangefeedState = TItem::EChangefeedState::CreateConsumers;
+            AllocateTxId(*importInfo, itemIdx);
+        } else if (++item.NextChangefeedIdx < item.Changefeeds.GetChangefeeds().size()) {
+            item.ChangefeedState = TItem::EChangefeedState::CreateChangefeed;
+            AllocateTxId(*importInfo, itemIdx);
+        } else {
+            item.State = EState::Done;
+        }
+    }
+
+    void ContinueParentAfterChildCompletion(
+        NIceDb::TNiceDb& db,
+        TImportInfo::TPtr importInfo,
+        ui32 itemIdx,
+        const TActorContext& ctx)
+    {
+        const auto& item = importInfo->Items.at(itemIdx);
+        if (item.State != EState::Done || item.ParentIdx == Max<ui32>()
+            || item.ParentIdx >= importInfo->Items.size()) {
+            return;
+        }
+
+        auto& parent = importInfo->Items[item.ParentIdx];
+        if (parent.State == EState::WaitingForIndexData
+            && parent.UsesSqlSchema()
+            && !HasPendingMaterializedChildren(*importInfo, parent)) {
+            ContinueSqlTableAfterData(db, importInfo, item.ParentIdx, ctx);
+        }
     }
 
     void AllocateTxId(TImportInfo& importInfo, ui32 itemIdx) {
@@ -1002,6 +1701,27 @@ private:
         return path->LastTxId;
     }
 
+    TTxId GetActiveCreateSchemeObjectTxId(const TImportInfo& importInfo, ui32 itemIdx) {
+        Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
+        const auto& item = importInfo.Items.at(itemIdx);
+
+        Y_ABORT_UNLESS(item.State == EState::CreateSchemeObject);
+
+        const auto path = TPath::Resolve(item.DstPathName, Self);
+        if (!path.IsResolved()) {
+            return InvalidTxId;
+        }
+
+        if (!IsIn({
+                NKikimrSchemeOp::EPathStateCreate,
+                NKikimrSchemeOp::EPathStateAlter,
+            }, path.Base()->PathState)) {
+            return InvalidTxId;
+        }
+
+        return path.Base()->LastTxId;
+    }
+
     TTxId GetActiveBuildIndexId(const TImportInfo& importInfo, ui32 itemIdx) {
         Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
         const auto& item = importInfo.Items.at(itemIdx);
@@ -1042,7 +1762,9 @@ private:
 
         Y_ABORT_UNLESS(item.State == EState::CreateChangefeed);
         Y_ABORT_UNLESS(item.ChangefeedState == TImportInfo::TItem::EChangefeedState::CreateConsumers);
-        Y_ABORT_UNLESS(item.StreamImplPathId);
+        if (!item.StreamImplPathId) {
+            return InvalidTxId;
+        }
 
         if (!Self->PathsById.contains(item.StreamImplPathId)) {
             return InvalidTxId;
@@ -1065,6 +1787,38 @@ private:
             Send(schemeQueryExecutor, new TEvents::TEvPoisonPill());
             Self->RunningImportSchemeQueryExecutors.erase(schemeQueryExecutor);
         }
+    }
+
+    void FinishCancellationIfSettled(
+        NIceDb::TNiceDb& db,
+        TImportInfo::TPtr importInfo)
+    {
+        if (DeferCancellationCompletion
+            || importInfo->State != EState::Cancellation
+            || importInfo->HasPendingCancellationWork()) {
+            return;
+        }
+
+        importInfo->State = EState::Cancelled;
+        importInfo->EndTime = TAppData::TimeProvider->Now();
+        Self->PersistImportState(db, *importInfo);
+        Self->EraseEncryptionKey(db, *importInfo);
+        SendNotificationsIfFinished(importInfo);
+        AuditLogImportEnd(*importInfo.Get(), Self);
+    }
+
+    void SettleItemAfterCancellation(
+        NIceDb::TNiceDb& db,
+        TImportInfo::TPtr importInfo,
+        ui32 itemIdx)
+    {
+        Y_ABORT_UNLESS(itemIdx < importInfo->Items.size());
+        auto& item = importInfo->Items[itemIdx];
+        item.WaitTxId = InvalidTxId;
+        item.SubState = ESubState::AllocateTxId;
+        item.State = EState::Cancelled;
+        Self->PersistImportItemState(db, *importInfo, itemIdx);
+        FinishCancellationIfSettled(db, importInfo);
     }
 
     void Cancel(TImportInfo& importInfo, ui32 itemIdx, TStringBuf marker) {
@@ -1092,11 +1846,18 @@ private:
 
         for (ui32 i : xrange(importInfo.Items.size())) {
             KillChildActors(importInfo.Items[i]);
-            if (i == itemIdx) {
-                continue;
-            }
-
             switch (importInfo.Items.at(i).State) {
+            case EState::CreateSchemeObject:
+            case EState::CreateChangefeed:
+                if (importInfo.Items.at(i).WaitTxId != InvalidTxId
+                    || importInfo.Items.at(i).SubState == ESubState::Proposed) {
+                    // Scheme operations are not cancellable. Their durable
+                    // transaction identity must remain until the result is
+                    // settled, so cancellation cannot become forgettable yet.
+                    importInfo.State = EState::Cancellation;
+                }
+                break;
+
             case EState::Transferring:
                 CancelTransferring(importInfo, i);
                 break;
@@ -1121,9 +1882,19 @@ private:
             auto& item = importInfo->Items[itemIdx];
 
             item.Issue = issue;
+            if (item.WaitTxId == InvalidTxId) {
+                // CancelAndPersist is reached only after a definitive local
+                // failure or response.  Do not leave a pre-send/failed
+                // proposal marker that cancellation could wait for forever.
+                item.SubState = ESubState::AllocateTxId;
+            }
             PersistImportItemState(db, *importInfo, itemIdx);
 
             if (importInfo->State != EState::Waiting) {
+                if (importInfo->State == EState::Cancellation
+                    && item.WaitTxId == InvalidTxId) {
+                    SettleItemAfterCancellation(db, importInfo, itemIdx);
+                }
                 return;
             }
         } else if (issue) {
@@ -1138,15 +1909,16 @@ private:
     }
 
     TMaybe<TString> GetIssues(const TImportInfo::TItem& item, TTxId restoreTxId) {
-        if (item.Table->store_type() == Ydb::Table::STORE_TYPE_COLUMN) {
-            Y_ABORT_UNLESS(Self->ColumnTables.contains(item.DstPathId));
+        if (Self->ColumnTables.contains(item.DstPathId)) {
             TColumnTableInfo::TPtr table = Self->ColumnTables.at(item.DstPathId).GetPtr();
             return GetIssues(table, restoreTxId);
-        } else {
-            Y_ABORT_UNLESS(Self->Tables.contains(item.DstPathId));
+        }
+        if (Self->Tables.contains(item.DstPathId)) {
             TTableInfo::TPtr table = Self->Tables.at(item.DstPathId);
             return GetIssues(table, restoreTxId);
         }
+        return TStringBuilder() << "destination table metadata is missing for path id "
+            << item.DstPathId;
     }
 
     template <typename TTable>
@@ -1222,8 +1994,19 @@ private:
                 if (ItemIdx) {
                     Resume(importInfo, *ItemIdx, txc, ctx);
                 } else {
+                    // After a reboot SubState is reconstructed in memory and
+                    // WaitTxId can be absent for every item.  Recover all
+                    // active operations before deciding that cancellation is
+                    // settled; otherwise an early inactive item could make
+                    // the import forgettable while a later mutation is live.
+                    DeferCancellationCompletion = importInfo->State == EState::Cancellation;
                     for (ui32 itemIdx : xrange(importInfo->Items.size())) {
                         Resume(importInfo, itemIdx, txc, ctx);
+                    }
+                    if (DeferCancellationCompletion) {
+                        DeferCancellationCompletion = false;
+                        NIceDb::TNiceDb db(txc.DB);
+                        FinishCancellationIfSettled(db, importInfo);
                     }
                 }
                 break;
@@ -1258,7 +2041,13 @@ private:
                 case EState::BuildIndexes:
                 case EState::CreateChangefeed:
                     if (item.WaitTxId == InvalidTxId) {
-                        if (!IsCreatedByQuery(item) || item.PreparedCreationQuery) {
+                        if (item.UsesSqlSchema() && item.State == EState::CreateSchemeObject) {
+                            if (item.PreparedCreationQuery) {
+                                AllocateTxId(*importInfo, itemIdx);
+                            } else {
+                                PrepareCurrentSqlOperation(db, importInfo, itemIdx, ctx);
+                            }
+                        } else if (!IsCreatedByQuery(item) || item.PreparedCreationQuery) {
                             AllocateTxId(*importInfo, itemIdx);
                         } else {
                             const auto database = GetDatabase(*Self);
@@ -1267,8 +2056,45 @@ private:
                             ));
                             Self->RunningImportSchemeQueryExecutors.emplace(item.SchemeQueryExecutor);
                         }
+                    } else if (item.UsesSqlSchema()
+                        && IsIn({EState::CreateSchemeObject, EState::CreateChangefeed}, item.State)
+                        && !item.TableSchemaPlan->GetCurrentOperationAccepted()) {
+                        if (item.State == EState::CreateSchemeObject) {
+                            if (!item.PreparedCreationQuery) {
+                                Self->TxIdToImport.erase(item.WaitTxId);
+                                item.WaitTxId = InvalidTxId;
+                                Self->PersistImportItemState(db, *importInfo, itemIdx);
+                                return CancelAndPersist(
+                                    db,
+                                    importInfo,
+                                    itemIdx,
+                                    "SQL proposal has a durable tx id but no prepared operation",
+                                    "cannot recover table SQL proposal");
+                            }
+                            if (!ExecutePreparedQuery(
+                                    txc, importInfo, itemIdx, item.WaitTxId)) {
+                                return;
+                            }
+                        } else {
+                            Y_ABORT_UNLESS(item.State == EState::CreateChangefeed);
+                            Y_ABORT_UNLESS(item.ChangefeedState
+                                == TItem::EChangefeedState::CreateConsumers);
+                            CreateConsumers(*importInfo, itemIdx, item.WaitTxId);
+                        }
                     } else {
                         SubscribeTx(*importInfo, itemIdx);
+                    }
+                    break;
+
+                case EState::WaitingForIndexData:
+                    if (!HasPendingMaterializedChildren(*importInfo, item)) {
+                        ContinueSqlTableAfterData(db, importInfo, itemIdx, ctx);
+                    }
+                    break;
+
+                case EState::Waiting:
+                    if (AllDoneOrWaiting(CountItemsByState(importInfo->Items))) {
+                        RetrySchemeObjectsQueryExecution(importInfo, db, ctx);
                     }
                     break;
 
@@ -1282,15 +2108,70 @@ private:
                 TTxId txId = InvalidTxId;
 
                 switch (item.State) {
+                case EState::CreateSchemeObject:
+                    if (item.WaitTxId != InvalidTxId) {
+                        if (item.UsesSqlSchema()
+                            && !item.TableSchemaPlan->GetCurrentOperationAccepted()) {
+                            if (!item.PreparedCreationQuery) {
+                                Self->TxIdToImport.erase(item.WaitTxId);
+                                item.WaitTxId = InvalidTxId;
+                                return CancelAndPersist(
+                                    db,
+                                    importInfo,
+                                    itemIdx,
+                                    "SQL proposal has a durable tx id but no prepared operation",
+                                    "cannot settle cancelled table SQL proposal");
+                            }
+                            // Recover the outcome with the same durable tx id.
+                            // This never allocates a competing mutation.
+                            ExecutePreparedQuery(
+                                txc, importInfo, itemIdx, item.WaitTxId);
+                        } else {
+                            SubscribeTx(*importInfo, itemIdx);
+                        }
+                    } else {
+                        txId = GetActiveCreateSchemeObjectTxId(*importInfo, itemIdx);
+                        if (txId == InvalidTxId) {
+                            SettleItemAfterCancellation(db, importInfo, itemIdx);
+                        }
+                    }
+                    break;
+
+                case EState::CreateChangefeed:
+                    if (item.WaitTxId != InvalidTxId) {
+                        if (item.UsesSqlSchema()
+                            && !item.TableSchemaPlan->GetCurrentOperationAccepted()) {
+                            Y_ABORT_UNLESS(item.ChangefeedState
+                                == TItem::EChangefeedState::CreateConsumers);
+                            CreateConsumers(*importInfo, itemIdx, item.WaitTxId);
+                        } else {
+                            SubscribeTx(*importInfo, itemIdx);
+                        }
+                    } else {
+                        txId = item.ChangefeedState == TItem::EChangefeedState::CreateChangefeed
+                            ? GetActiveCreateChangefeedTxId(*importInfo, itemIdx)
+                            : GetActiveCreateConsumerTxId(*importInfo, itemIdx);
+                        if (txId == InvalidTxId) {
+                            SettleItemAfterCancellation(db, importInfo, itemIdx);
+                        }
+                    }
+                    break;
+
                 case EState::Transferring:
                     if (!CancelTransferring(*importInfo, itemIdx)) {
                         txId = GetActiveRestoreTxId(*importInfo, itemIdx);
+                        if (txId == InvalidTxId) {
+                            SettleItemAfterCancellation(db, importInfo, itemIdx);
+                        }
                     }
                     break;
 
                 case EState::BuildIndexes:
                     if (!CancelIndexBuilding(*importInfo, itemIdx)) {
                         txId = GetActiveBuildIndexId(*importInfo, itemIdx);
+                        if (txId == InvalidTxId) {
+                            SettleItemAfterCancellation(db, importInfo, itemIdx);
+                        }
                     }
                     break;
 
@@ -1300,9 +2181,15 @@ private:
 
                 if (txId != InvalidTxId) {
                     item.WaitTxId = txId;
+                    Self->TxIdToImport[txId] = {importInfo->Id, itemIdx};
                     Self->PersistImportItemState(db, *importInfo, itemIdx);
 
                     switch (item.State) {
+                    case EState::CreateSchemeObject:
+                    case EState::CreateChangefeed:
+                        SubscribeTx(*importInfo, itemIdx);
+                        break;
+
                     case EState::Transferring:
                         CancelTransferring(*importInfo, itemIdx);
                         break;
@@ -1353,13 +2240,38 @@ private:
         NIceDb::TNiceDb db(txc.DB);
 
         auto& item = importInfo->Items.at(msg.ItemIdx);
+        if (item.SchemeGetter != SchemeResult->Sender) {
+            YDB_LOG_WARN("TImport::TTxProgress: ignoring stale scheme getter result",
+                {"id", msg.ImportId},
+                {"itemIdx", msg.ItemIdx},
+                {"sender", SchemeResult->Sender},
+                {"expected", item.SchemeGetter},
+            );
+            return;
+        }
         Self->RunningImportSchemeGetters.erase(std::exchange(item.SchemeGetter, {}));
 
         if (!msg.Success) {
-            return CancelAndPersist(db, importInfo, msg.ItemIdx, msg.Error, "cannot get scheme");
+            Self->PersistImportItemScheme(db, *importInfo, msg.ItemIdx);
+            return CancelAndPersist(
+                db, importInfo, msg.ItemIdx,
+                WithTableFallbackContext(item, msg.Error),
+                "cannot get scheme");
         }
 
-        if (IsCreatedByQuery(item)) {
+        // Persist the selected source and the complete SQL plan before starting
+        // any compiler actor or allocating a mutation transaction.
+        Self->PersistImportItemScheme(db, *importInfo, msg.ItemIdx);
+
+        if (item.UsesSqlSchema()) {
+            if (!BeginSqlPhase(
+                    db, importInfo, msg.ItemIdx, TTableSchemaPlan::PHASE_BEFORE_DATA, ctx)) {
+                return CancelAndPersist(
+                    db, importInfo, msg.ItemIdx,
+                    "table SQL plan has no before-data statements",
+                    "invalid table SQL plan");
+            }
+        } else if (IsCreatedByQuery(item)) {
             // Send the creation query to KQP to prepare.
             const auto database = GetDatabase(*Self);
             const TString source = TStringBuilder() << item.SrcPath;
@@ -1369,6 +2281,7 @@ private:
                 issues.AddIssue(TStringBuilder() << "path: " << source);
                 return CancelAndPersist(db, importInfo, msg.ItemIdx, issues.ToString(), "invalid creation query");
             }
+            Self->PersistImportItemScheme(db, *importInfo, msg.ItemIdx);
 
             item.SchemeQueryExecutor = ctx.Register(CreateSchemeQueryExecutor(
                 Self->SelfId(), msg.ImportId, msg.ItemIdx, item.CreationQuery, database
@@ -1377,19 +2290,20 @@ private:
         } else if (item.Table) {
             TString error;
             if (!CreateTablePropose(Self, TTxId(), *importInfo, msg.ItemIdx, error)) {
-                return CancelAndPersist(db, importInfo, msg.ItemIdx, error, "invalid table scheme");
+                return CancelAndPersist(
+                    db, importInfo, msg.ItemIdx,
+                    WithTableFallbackContext(item, std::move(error)),
+                    "invalid table scheme");
             }
         }
 
-        if (!IsCreatedByQuery(item)) {
+        if (!item.UsesSqlSchema() && !IsCreatedByQuery(item)) {
             if (item.SysView) {
                 ProcessSysViewRestore(txc, importInfo, msg.ItemIdx, ctx);
             } else {
                 AllocateTxId(*importInfo, msg.ItemIdx);
             }
         }
-
-        Self->PersistImportItemScheme(db, *importInfo, msg.ItemIdx);
 
         if (item.State != EState::Done) {
             item.State = EState::CreateSchemeObject;
@@ -1425,6 +2339,8 @@ private:
         if (AllDone(stateCounts)) {
             importInfo->State = EState::Done;
             importInfo->EndTime = TAppData::TimeProvider->Now();
+        } else if (AllDoneOrWaiting(stateCounts)) {
+            RetrySchemeObjectsQueryExecution(importInfo, db, ctx);
         }
 
         Self->PersistImportState(db, *importInfo);
@@ -1454,6 +2370,14 @@ private:
         }
 
         TImportInfo::TPtr importInfo = Self->Imports.at(msg.ImportId);
+        if (importInfo->SchemaMappingGetter != SchemaMappingResult->Sender) {
+            YDB_LOG_WARN("TImport::TTxProgress: ignoring stale schema mapping getter result",
+                {"id", msg.ImportId},
+                {"sender", SchemaMappingResult->Sender},
+                {"expected", importInfo->SchemaMappingGetter},
+            );
+            return;
+        }
 
         NIceDb::TNiceDb db(txc.DB);
 
@@ -1517,9 +2441,54 @@ private:
         NIceDb::TNiceDb db(txc.DB);
 
         auto& item = importInfo->Items[message.ItemIdx];
+        if (item.SchemeQueryExecutor != SchemeQueryResult->Sender) {
+            YDB_LOG_WARN("TImport::TTxProgress: ignoring stale scheme preparation result",
+                {"id", message.ImportId},
+                {"itemIdx", message.ItemIdx},
+                {"sender", SchemeQueryResult->Sender},
+                {"expected", item.SchemeQueryExecutor},
+            );
+            return;
+        }
+        if (item.UsesSqlSchema()
+            && (item.TableSchemaPlan->GetStatementCursor() >= static_cast<ui32>(item.TableSchemaPlan->StatementsSize())
+                || message.StatementOrdinal != item.TableSchemaPlan->GetStatements(
+                    item.TableSchemaPlan->GetStatementCursor()).GetOrdinal()
+                || message.PreparationAttempt != item.TableSchemaPlan->GetPreparationAttempt())) {
+            YDB_LOG_WARN("TImport::TTxProgress: ignoring stale SQL table preparation result",
+                {"id", message.ImportId},
+                {"itemIdx", message.ItemIdx},
+                {"statementOrdinal", message.StatementOrdinal},
+                {"preparationAttempt", message.PreparationAttempt},
+            );
+            return;
+        }
         Self->RunningImportSchemeQueryExecutors.erase(std::exchange(item.SchemeQueryExecutor, {}));
 
-        if (message.Status == Ydb::StatusIds::SCHEME_ERROR) {
+        if (item.UsesSqlSchema() && message.Status != Ydb::StatusIds::SUCCESS) {
+            if (IsSqlBaseCreate(item) && item.CanFallbackToProtobuf()
+                && message.Status == Ydb::StatusIds::SCHEME_ERROR) {
+                return DelayObjectCreation(importInfo, message.ItemIdx, db, error, ctx);
+            }
+            if (IsSqlBaseCreate(item) && item.CanFallbackToProtobuf()
+                && CanFallbackAfterPreparationFailure(message.Status)) {
+                return SelectProtobufFallback(
+                    db,
+                    importInfo,
+                    message.ItemIdx,
+                    TStringBuilder() << "SQL CREATE preparation failed with status "
+                        << static_cast<ui32>(message.Status) << ": " << error);
+            }
+            return CancelAndPersist(
+                db,
+                importInfo,
+                message.ItemIdx,
+                TStringBuilder() << "SQL statement " << message.StatementOrdinal
+                    << " preparation failed: " << error,
+                "table SQL preparation failed");
+        }
+
+        if (!item.UsesSqlSchema() && message.Status == Ydb::StatusIds::SCHEME_ERROR) {
             // Scheme error happens when the creation query depends on other objects that are not yet imported.
             return DelayObjectCreation(importInfo, message.ItemIdx, db, error, ctx);
         }
@@ -1528,8 +2497,83 @@ private:
             return CancelAndPersist(db, importInfo, message.ItemIdx, error, "creation query failed");
         }
 
-        if (item.State == EState::CreateSchemeObject) {
-            item.PreparedCreationQuery = std::get<NKikimrSchemeOp::TModifyScheme>(message.Result);
+        if (item.State == EState::CreateSchemeObject && item.UsesSqlSchema()) {
+            auto& plan = *item.TableSchemaPlan;
+            auto* statement = plan.MutableStatements(plan.GetStatementCursor());
+            auto operations = std::get<TEvPrivate::TEvImportSchemeQueryResult::TPreparedOperations>(message.Result);
+
+            for (const auto& operation : operations) {
+                TString validationError;
+                if (!ValidateSqlTableOperation(operation, *statement, validationError)) {
+                    if (IsSqlBaseCreate(item) && item.CanFallbackToProtobuf()) {
+                        return SelectProtobufFallback(
+                            db, importInfo, message.ItemIdx,
+                            TStringBuilder() << "prepared SQL CREATE validation failed: "
+                                << validationError);
+                    }
+                    return CancelAndPersist(
+                        db, importInfo, message.ItemIdx, validationError,
+                        "prepared table SQL operation escaped its target");
+                }
+            }
+
+            if (statement->GetKind() == TTableSchemaPlan::STATEMENT_KIND_CREATE_TABLE) {
+                plan.ClearIndexes();
+                for (const auto& operation : operations) {
+                    if (operation.GetOperationType() == NKikimrSchemeOp::ESchemeOpCreateIndexedTable) {
+                        for (const auto& index : operation.GetCreateIndexedTable().GetIndexDescription()) {
+                            *plan.AddIndexes() = index;
+                        }
+                    }
+                }
+                TString indexSelectionError;
+                bool indexSelectionAllowsFallback = false;
+                if (!FilterSqlMaterializedChildren(
+                        db, *importInfo, message.ItemIdx,
+                        indexSelectionError, indexSelectionAllowsFallback)) {
+                    if (indexSelectionAllowsFallback
+                        && IsSqlBaseCreate(item)
+                        && item.CanFallbackToProtobuf()) {
+                        return SelectProtobufFallback(
+                            db, importInfo, message.ItemIdx,
+                            TStringBuilder() << "SQL CREATE index validation failed: "
+                                << indexSelectionError);
+                    }
+                    return CancelAndPersist(
+                        db, importInfo, message.ItemIdx, indexSelectionError,
+                        "table SQL index selection failed");
+                }
+
+                for (auto& operation : operations) {
+                    TString normalizeError;
+                    if (!NormalizeSqlTableCreate(operation, *importInfo, message.ItemIdx, normalizeError)) {
+                        if (IsSqlBaseCreate(item) && item.CanFallbackToProtobuf()) {
+                            return SelectProtobufFallback(
+                                db, importInfo, message.ItemIdx,
+                                TStringBuilder() << "SQL CREATE normalization failed: "
+                                    << normalizeError);
+                        }
+                        return CancelAndPersist(
+                            db, importInfo, message.ItemIdx, normalizeError,
+                            "table SQL create normalization failed");
+                    }
+                }
+            }
+
+            statement->ClearPreparedOperations();
+            for (auto& operation : operations) {
+                *statement->AddPreparedOperations() = std::move(operation);
+            }
+            plan.SetOperationCursor(0);
+            plan.SetCurrentOperationAccepted(false);
+            item.PreparedCreationQuery = statement->GetPreparedOperations(0);
+            Self->PersistImportItemTableSchemaPlan(db, *importInfo, message.ItemIdx);
+            Self->PersistImportItemPreparedCreationQuery(db, *importInfo, message.ItemIdx);
+            AllocateTxId(*importInfo, message.ItemIdx);
+        } else if (item.State == EState::CreateSchemeObject) {
+            const auto& operations = std::get<TEvPrivate::TEvImportSchemeQueryResult::TPreparedOperations>(message.Result);
+            Y_ABORT_UNLESS(operations.size() == 1);
+            item.PreparedCreationQuery = operations.front();
             PersistImportItemPreparedCreationQuery(db, *importInfo, message.ItemIdx);
             if (item.PreparedCreationQuery->HasReplication()) {
                 // In case async replication or transfer is created, it is essential to execute modify scheme
@@ -1574,7 +2618,9 @@ private:
             switch (item.State) {
             case EState::CreateSchemeObject:
                 if (item.PreparedCreationQuery) {
-                    ExecutePreparedQuery(txc, importInfo, i, txId);
+                    if (!ExecutePreparedQuery(txc, importInfo, i, txId)) {
+                        return;
+                    }
                     itemIdx = i;
                     break;
                 }
@@ -1583,6 +2629,7 @@ private:
                     if (!CreateTopic(*importInfo, i, txId, error)) {
                         NIceDb::TNiceDb db(txc.DB);
                         CancelAndPersist(db, importInfo, i, error, "creation topic failed");
+                        return;
                     }
                     itemIdx = i;
                     break;
@@ -1605,18 +2652,34 @@ private:
                 if (!Self->TableProfilesLoaded) {
                     Self->WaitForTableProfiles(id, i);
                 } else if (item.Table) {
-                    CreateTable(*importInfo, i, txId);
+                    TString error;
+                    if (!CreateTable(*importInfo, i, txId, error)) {
+                        NIceDb::TNiceDb db(txc.DB);
+                        CancelAndPersist(
+                            db, importInfo, i,
+                            WithTableFallbackContext(item, std::move(error)),
+                            "invalid table scheme");
+                        return;
+                    }
                     itemIdx = i;
                 }
                 break;
 
             case EState::Transferring:
-                TransferData(*importInfo, i, txId);
+                if (TString error; !TransferData(*importInfo, i, txId, error)) {
+                    NIceDb::TNiceDb db(txc.DB);
+                    CancelAndPersist(db, importInfo, i, error, "invalid table data layout");
+                    return;
+                }
                 itemIdx = i;
                 break;
 
             case EState::BuildIndexes:
-                BuildIndex(*importInfo, i, txId);
+                if (TString error; !BuildIndex(*importInfo, i, txId, error)) {
+                    NIceDb::TNiceDb db(txc.DB);
+                    CancelAndPersist(db, importInfo, i, error, "invalid SQL index build plan");
+                    return;
+                }
                 itemIdx = i;
                 break;
 
@@ -1626,8 +2689,16 @@ private:
                     if (!CreateChangefeed(*importInfo, i, txId, error)) {
                         NIceDb::TNiceDb db(txc.DB);
                         CancelAndPersist(db, importInfo, i, error, "creation changefeed failed");
+                        return;
                     }
                 } else {
+                    if (item.UsesSqlSchema()) {
+                        item.WaitTxId = txId;
+                        item.TableSchemaPlan->SetCurrentOperationAccepted(false);
+                        NIceDb::TNiceDb db(txc.DB);
+                        Self->PersistImportItemState(db, *importInfo, i);
+                        Self->PersistImportItemTableSchemaPlan(db, *importInfo, i);
+                    }
                     CreateConsumers(*importInfo, i, txId);
                 }
                 itemIdx = i;
@@ -1685,6 +2756,43 @@ private:
 
         Y_ABORT_UNLESS(itemIdx < importInfo->Items.size());
         auto& item = importInfo->Items.at(itemIdx);
+        const bool isSqlSchemaOperation = item.UsesSqlSchema()
+            && item.State == EState::CreateSchemeObject;
+        const bool isSqlTrackedSchemeOperation = item.UsesSqlSchema()
+            && IsIn({EState::CreateSchemeObject, EState::CreateChangefeed}, item.State);
+        const bool isOwnedSchemeTransaction = IsIn({
+                EState::CreateSchemeObject,
+                EState::CreateChangefeed,
+            }, item.State)
+            && IsIn({
+                NKikimrScheme::StatusMultipleModifications,
+                NKikimrScheme::StatusAlreadyExists,
+            }, record.GetStatus())
+            && record.GetPathCreateTxId() == ui64(txId);
+        const bool isOwnedSqlTransaction = isSqlTrackedSchemeOperation
+            && isOwnedSchemeTransaction;
+        const TTxId completedTxId = txId;
+
+        if (importInfo->State == EState::Cancellation) {
+            if (record.GetStatus() == NKikimrScheme::StatusSuccess) {
+                Self->TxIdToImport.erase(txId);
+                item.WaitTxId = InvalidTxId;
+                if (isSqlSchemaOperation) {
+                    AdvanceSqlOperation(db, importInfo, itemIdx, ctx, false);
+                }
+                SettleItemAfterCancellation(db, importInfo, itemIdx);
+                return;
+            }
+
+            if (IsIn({EState::CreateSchemeObject, EState::CreateChangefeed}, item.State)
+                && record.GetStatus() != NKikimrScheme::StatusAccepted
+                && !isOwnedSchemeTransaction) {
+                Self->TxIdToImport.erase(txId);
+                item.WaitTxId = InvalidTxId;
+                SettleItemAfterCancellation(db, importInfo, itemIdx);
+                return;
+            }
+        }
 
         if (IsCreatedByQuery(item)) {
             // As for created by query objects query must be compiled to execute
@@ -1698,10 +2806,66 @@ private:
         if (record.GetStatus() == NKikimrScheme::StatusSuccess) {
             Self->TxIdToImport.erase(txId);
             txId = InvalidTxId;
-            item.State = EState::Done;
-        } else if (record.GetStatus() != NKikimrScheme::StatusAccepted) {
+            item.WaitTxId = InvalidTxId;
+            if (isSqlSchemaOperation) {
+                AdvanceSqlOperation(
+                    db, importInfo, itemIdx, ctx,
+                    importInfo->State == EState::Waiting);
+            } else if (importInfo->State == EState::Waiting
+                && item.UsesSqlSchema()
+                && item.State == EState::Transferring) {
+                if (const auto issue = GetIssues(item, completedTxId)) {
+                    return CancelAndPersist(
+                        db, importInfo, itemIdx, *issue,
+                        "issues during synchronous SQL table restore");
+                }
+                ContinueSqlTableAfterData(db, importInfo, itemIdx, ctx);
+            } else if (importInfo->State == EState::Waiting
+                && item.UsesSqlSchema()
+                && item.State == EState::CreateChangefeed) {
+                AdvanceChangefeedAfterCompletion(db, importInfo, itemIdx);
+            } else {
+                item.State = EState::Done;
+            }
+        } else if (record.GetStatus() != NKikimrScheme::StatusAccepted
+            && !isOwnedSqlTransaction) {
             Self->TxIdToImport.erase(txId);
             txId = InvalidTxId;
+            item.WaitTxId = InvalidTxId;
+
+            if (isSqlSchemaOperation) {
+                if (importInfo->State != EState::Waiting) {
+                    Self->PersistImportItemState(db, *importInfo, itemIdx);
+                    return;
+                }
+                if (IsSqlBaseCreate(item)
+                    && item.CanFallbackToProtobuf()
+                    && ShouldRetrySqlBaseProposal(record.GetStatus())) {
+                    return DelayObjectCreation(
+                        importInfo, itemIdx, db, record.GetReason(), ctx);
+                }
+                if (IsSqlBaseCreate(item)
+                    && item.CanFallbackToProtobuf()
+                    && CanFallbackAfterProposalFailure(record.GetStatus())) {
+                    SelectProtobufFallback(
+                        db,
+                        importInfo,
+                        itemIdx,
+                        TStringBuilder() << "SQL CREATE was rejected before apply: "
+                            << record.GetReason());
+                    Self->PersistImportState(db, *importInfo);
+                    return;
+                }
+                return CancelAndPersist(
+                    db,
+                    importInfo,
+                    itemIdx,
+                    TStringBuilder() << "SQL statement "
+                        << item.TableSchemaPlan->GetStatements(
+                            item.TableSchemaPlan->GetStatementCursor()).GetOrdinal()
+                        << " proposal failed: " << record.GetReason(),
+                    "table SQL proposal failed");
+            }
 
             if (IsIn({ NKikimrScheme::StatusMultipleModifications, NKikimrScheme::StatusAlreadyExists },
                 record.GetStatus()
@@ -1724,22 +2888,23 @@ private:
 
             if (txId == InvalidTxId) {
                 if (record.GetStatus() == NKikimrScheme::StatusAlreadyExists && item.State == EState::CreateChangefeed) {
-                    if (item.ChangefeedState == TImportInfo::TItem::EChangefeedState::CreateChangefeed) {
-                        item.ChangefeedState = TImportInfo::TItem::EChangefeedState::CreateConsumers;
-                        AllocateTxId(*importInfo, itemIdx);
-                    } else if (++item.NextChangefeedIdx < item.Changefeeds.GetChangefeeds().size()) {
-                        item.ChangefeedState = TImportInfo::TItem::EChangefeedState::CreateChangefeed;
-                        AllocateTxId(*importInfo, itemIdx);
-                    } else {
-                        item.State = EState::Done;
+                    AdvanceChangefeedAfterCompletion(db, importInfo, itemIdx);
+                } else {
+                    TString error = record.GetReason();
+                    if (item.State == EState::CreateSchemeObject) {
+                        error = WithTableFallbackContext(item, std::move(error));
                     }
-                    return;
+                    return CancelAndPersist(db, importInfo, itemIdx, error, "unhappy propose");
                 }
-
-                return CancelAndPersist(db, importInfo, itemIdx, record.GetReason(), "unhappy propose");
+            } else {
+                Self->TxIdToImport[txId] = {importInfo->Id, itemIdx};
             }
+        }
 
-            Self->TxIdToImport[txId] = {importInfo->Id, itemIdx};
+        if (isSqlTrackedSchemeOperation
+            && (record.GetStatus() == NKikimrScheme::StatusAccepted || isOwnedSqlTransaction)) {
+            item.TableSchemaPlan->SetCurrentOperationAccepted(true);
+            Self->PersistImportItemTableSchemaPlan(db, *importInfo, itemIdx);
         }
 
         item.WaitTxId = txId;
@@ -1750,10 +2915,13 @@ private:
             return;
         }
 
-        if (item.State == EState::Done || item.State == EState::CreateSchemeObject) {
+        if (!item.UsesSqlSchema()
+            && (item.State == EState::Done || item.State == EState::CreateSchemeObject)) {
             UpdateItemDstPathId(db, *importInfo, itemIdx);
             for (auto childIdx : item.ChildItems) {
-                UpdateItemDstPathId(db, *importInfo, childIdx);
+                if (importInfo->Items.at(childIdx).State != EState::Done) {
+                    UpdateItemDstPathId(db, *importInfo, childIdx);
+                }
             }
         }
 
@@ -1761,10 +2929,14 @@ private:
             SubscribeTx(*importInfo, itemIdx);
         }
 
+        ContinueParentAfterChildCompletion(db, importInfo, itemIdx, ctx);
+
         const auto stateCounts = CountItemsByState(importInfo->Items);
         if (AllDone(stateCounts)) {
             importInfo->State = EState::Done;
             importInfo->EndTime = TAppData::TimeProvider->Now();
+        } else if (AllDoneOrWaiting(stateCounts)) {
+            RetrySchemeObjectsQueryExecution(importInfo, db, ctx);
         }
 
         Self->PersistImportState(db, *importInfo);
@@ -1834,18 +3006,19 @@ private:
             }
 
             if (txId == InvalidTxId) {
-                item.Issue = GetIssues(record);
-                Self->PersistImportItemState(db, *importInfo, itemIdx);
+                const TString issue = GetIssues(record);
 
                 if (importInfo->State != EState::Waiting) {
+                    if (importInfo->State == EState::Cancellation) {
+                        item.WaitTxId = InvalidTxId;
+                        item.Issue = issue;
+                        SettleItemAfterCancellation(db, importInfo, itemIdx);
+                    }
                     return;
                 }
 
-                Cancel(*importInfo, itemIdx, "unhappy propose");
-                Self->PersistImportState(db, *importInfo);
-                Self->EraseEncryptionKey(db, *importInfo);
-
-                return SendNotificationsIfFinished(importInfo);
+                return CancelAndPersist(
+                    db, importInfo, itemIdx, issue, "unhappy index build proposal");
             }
 
             Self->TxIdToImport[txId] = {importInfo->Id, itemIdx};
@@ -1887,15 +3060,30 @@ private:
         }
 
         TImportInfo::TPtr importInfo = Self->Imports.at(id);
-
-        if (importInfo->State != EState::Waiting) {
-            return;
-        }
-
         NIceDb::TNiceDb db(txc.DB);
 
         Y_ABORT_UNLESS(itemIdx < importInfo->Items.size());
         auto& item = importInfo->Items.at(itemIdx);
+
+        if (importInfo->State != EState::Waiting) {
+            if (importInfo->State == EState::Cancellation) {
+                item.WaitTxId = InvalidTxId;
+                Self->TxIdToImport.erase(txId);
+                if (item.UsesSqlSchema() && item.State == EState::CreateSchemeObject) {
+                    // The transaction completed while cancellation was in
+                    // progress. Record the mutation fence/cursor, but never
+                    // schedule the next statement.
+                    AdvanceSqlOperation(db, importInfo, itemIdx, ctx, false);
+                }
+                SettleItemAfterCancellation(db, importInfo, itemIdx);
+            } else if (item.UsesSqlSchema() && item.State == EState::CreateSchemeObject) {
+                item.WaitTxId = InvalidTxId;
+                Self->TxIdToImport.erase(txId);
+                AdvanceSqlOperation(db, importInfo, itemIdx, ctx, false);
+                Self->PersistImportItemState(db, *importInfo, itemIdx);
+            }
+            return;
+        }
 
         item.WaitTxId = InvalidTxId;
         Self->PersistImportItemState(db, *importInfo, itemIdx);
@@ -1904,7 +3092,10 @@ private:
 
         switch (item.State) {
         case EState::CreateSchemeObject:
-            if (IsCreatedByQuery(item)) {
+            if (item.UsesSqlSchema()) {
+                AdvanceSqlOperation(db, importInfo, itemIdx, ctx, true);
+                break;
+            } else if (IsCreatedByQuery(item)) {
                 item.State = EState::Done;
                 break;
             } else if (item.Topic) {
@@ -1915,6 +3106,10 @@ private:
                 for (auto childIdx : item.ChildItems) {
                     Y_ABORT_UNLESS(childIdx < importInfo->Items.size());
                     auto& childItem = importInfo->Items.at(childIdx);
+
+                    if (childItem.State == EState::Done) {
+                        continue;
+                    }
 
                     childItem.State = EState::Transferring;
                     Self->PersistImportItemState(db, *importInfo, childIdx);
@@ -1933,7 +3128,9 @@ private:
                 Cancel(*importInfo, itemIdx, "issues during restore " + *issue);
                 Self->EraseEncryptionKey(db, *importInfo);
             } else {
-                if (PrepareNextBuildableIndex(*importInfo, itemIdx, item)) {
+                if (item.UsesSqlSchema()) {
+                    ContinueSqlTableAfterData(db, importInfo, itemIdx, ctx);
+                } else if (PrepareNextBuildableIndex(*importInfo, itemIdx, item)) {
                     item.State = EState::BuildIndexes;
                     AllocateTxId(*importInfo, itemIdx);
                 } else if (item.NextChangefeedIdx < item.Changefeeds.changefeeds_size() &&
@@ -1957,6 +3154,11 @@ private:
                 }
                 if (PrepareNextBuildableIndex(*importInfo, itemIdx, item)) {
                     AllocateTxId(*importInfo, itemIdx);
+                } else if (item.UsesSqlSchema()) {
+                    if (!BeginSqlPhase(
+                            db, importInfo, itemIdx, TTableSchemaPlan::PHASE_AFTER_INDEXES, ctx)) {
+                        FinishSqlPhase(db, importInfo, itemIdx, ctx);
+                    }
                 } else if (item.NextChangefeedIdx < item.Changefeeds.changefeeds_size() &&
                            AppData()->FeatureFlags.GetEnableChangefeedsImport()) {
                     item.State = EState::CreateChangefeed;
@@ -1968,27 +3170,21 @@ private:
             break;
 
         case EState::CreateChangefeed:
-            if (item.ChangefeedState == TImportInfo::TItem::EChangefeedState::CreateChangefeed) {
-                item.ChangefeedState = TImportInfo::TItem::EChangefeedState::CreateConsumers;
-                AllocateTxId(*importInfo, itemIdx);
-            } else if (++item.NextChangefeedIdx < item.Changefeeds.GetChangefeeds().size()) {
-                item.ChangefeedState = TImportInfo::TItem::EChangefeedState::CreateChangefeed;
-                AllocateTxId(*importInfo, itemIdx);
-            } else {
-                item.State = EState::Done;
-            }
+            AdvanceChangefeedAfterCompletion(db, importInfo, itemIdx);
             break;
 
         default:
             return SendNotificationsIfFinished(importInfo);
         }
 
+        ContinueParentAfterChildCompletion(db, importInfo, itemIdx, ctx);
+
         const auto stateCounts = CountItemsByState(importInfo->Items);
         if (AllDone(stateCounts)) {
             importInfo->State = EState::Done;
             importInfo->EndTime = TAppData::TimeProvider->Now();
         } else if (AllDoneOrWaiting(stateCounts)) {
-            RetrySchemeObjectsQueryExecution(*importInfo, db, ctx);
+            RetrySchemeObjectsQueryExecution(importInfo, db, ctx);
         }
 
         Self->PersistImportItemState(db, *importInfo, itemIdx);
